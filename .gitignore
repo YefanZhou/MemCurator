@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Slurm outputs
+slurm_output/
+slurm_outputs/
+
+# Evaluation logs and generated results
+evaluation/agent_eval/logs/
+evaluation/agent_eval/logs_debug/
+evaluation/agent_eval/vllm_logs/
+evaluation/agent_eval/Alfworld/results/
+evaluation/analysis/
+
+# Streaming/evaluation run outputs
+skills/evaluation/
+
+# Model checkpoints and weights
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+
+# Large data files
+*.pkl
+*.npy
+*.npz
+*.arrow
+*.parquet
+*.h5
+*.hdf5
+
+# Environment
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code settings
+.claude/
+
+# OS
+.DS_Store

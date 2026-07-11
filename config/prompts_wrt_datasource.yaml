@@ -1,0 +1,96 @@
+# unified_prompt: "You will be given a past experience of solving a math problem, which includes the oritinal problem and the attempted solution with reasoning process. Your task is to analyze the experience and extract **transferable skills and generalizable strategies** that could be useful to future, unseen problems. To complete the task, you need to follow these steps:\n\n**1. Analyze the original trajectory.** Specifically, you need to first **judge** the original experience and tell whether it successfully resolve the problem or not. If success, what memory could be reused, and if not, what memory could help avoid such failures.  \n\n**2. Memory update.** Based on the experience and your analysis, update the following 3 memory types to facilitate future transfer to different but related mathematical problems. \n **(i)Planning Memory (Meta-Reasoning Protocols and Strategic Planning)**: Extract high-level how-to-solve-the-problem frameworks. Avoid problem-specific values. For example, Systematic Problem Analysis Framework (format: State problem requirements clearly; List key observations and theorems applicable; Identify patterns and relationships; etc.) \n **(ii)Skills Memory (Concrete Strategies)**: Formulate specific **Useful insights** or **Reusable Skill/Concept/Strategies** derived from this experience. (format: When proving inequality involving symmetry, check Without Loss of Generality assumption.)\n **(iii)Knowledge Memory (General/Principled Knowledge)** Extract fundamental mathematical truths, definitions, or constants used. (format: The decimal value of a number in base N is calculated by summing each digit multiplied by N raised to the power of its position.)\n\n<new_experience>\n{context}\n</new_experience>\n\n**Important**: Response limit is {max_new_tokens} tokens. Focus on **generalization**: extract the *insights* behind the solution, not just the solution itself. "
+
+unified_prompt: "# Input (New Experience) \n\n{context}\n\n**Important**: Response limit is {max_new_tokens} tokens. Focus on **generalization**: extract the *insights* behind the new experience, not just the solution itself. "
+
+squad:
+    query_prompt: null
+    including_core: true
+
+math:
+    query_prompt: "Your planning memory contains meta-reasoning protocols and strategic planning. Your knowledge memory contains general/principled knowledge including fundamental mathematical truths, definitions. Your skills memory includes concrete strategies including specific useful insights, reusable skill/concepts derived from past experiences. Use your memory to assist in solving the user's math problems if you find some memory items helpful. **In your response, if you choose to use a memory, explicitly state which memory you used. If not, explicitly state why you do not use memory.** \nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    including_core: true
+
+aime24:
+    query_prompt: "Your planning memory contains meta-reasoning protocols and strategic planning. Your knowledge memory contains general/principled knowledge including fundamental mathematical truths, definitions. Your skills memory includes concrete strategies including specific useful insights, reusable skill/concepts derived from past experiences. Use your memory to assist in solving the user's math problems if you find some memory items helpful. **In your response, if you choose to use a memory, explicitly state which memory you used. If not, explicitly state why you do not use memory.** \nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    including_core: true
+
+aime25:
+    query_prompt: "Your planning memory contains meta-reasoning protocols and strategic planning. Your knowledge memory contains general/principled knowledge including fundamental mathematical truths, definitions. Your skills memory includes concrete strategies including specific useful insights, reusable skill/concepts derived from past experiences. Use your memory to assist in solving the user's math problems if you find some memory items helpful. **In your response, if you choose to use a memory, explicitly state which memory you used. If not, explicitly state why you do not use memory.** \nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    including_core: true
+
+amc23:
+    query_prompt: "Your planning memory contains meta-reasoning protocols and strategic planning. Your knowledge memory contains general/principled knowledge including fundamental mathematical truths, definitions. Your skills memory includes concrete strategies including specific useful insights, reusable skill/concepts derived from past experiences. Use your memory to assist in solving the user's math problems if you find some memory items helpful. **In your response, if you choose to use a memory, explicitly state which memory you used. If not, explicitly state why you do not use memory.** \nPlease reason step by step, and put your final answer within \\boxed{{}}."
+    including_core: true
+
+hotpotqa:
+    query_prompt: null
+    including_core: true
+
+booksum:
+    query_prompt: "Your core memory contains a comprehensive book summary. Use this information to fulfill the user's request."
+    including_core: true
+
+pubmed-rct:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+ttl_train:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Your semantic memory likely includes example labels. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+perltqa:
+    query_prompt: null
+    including_core: true
+
+lme_train:
+    query_prompt: null
+    including_core: true
+
+accurate_retrieval:
+    query_prompt: null
+    including_core: true
+
+ruler_qa1_197K:
+    query_prompt: null
+    including_core: true
+
+ruler_qa2_421K:
+    query_prompt: null
+    including_core: true
+
+infbench_qa_eng_shots2:
+    query_prompt: "The book has been memorized in the memory. Answer the question as briefly as possible. Only output the answer with no other text."
+    including_core: true
+
+longmemeval_s*:
+    query_prompt: null
+    including_core: true
+
+long_range_understanding:
+    query_prompt: "Your core memory contains a comprehensive book summary. Use this information to fulfill the user's request."
+    including_core: true
+
+test_time_learning:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Your semantic memory likely includes example labels. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+
+icl_banking77_5900shot_balance:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Your semantic memory likely includes example labels. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+icl_clinic150_7050shot_balance:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Your semantic memory likely includes example labels. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+icl_nlu_8296shot_balance:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Your semantic memory likely includes example labels. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+icl_trec_coarse_6600shot_balance:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true
+
+icl_trec_fine_6400shot_balance:
+    query_prompt: "Your core memory is used to store the classification rules of the articles. Identify the meaning of each class and how the article is classified. Fulfill the user's request with the core memory.\n\nWhen answering questions, you should put the final prediction in the format of \\boxed{label}. Note that the label is a single number."
+    including_core: true

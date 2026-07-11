@@ -1,0 +1,11 @@
+is_cold_start: false
+
+policy:
+  build: "direct"       # Options: "round", "direct"
+  retrieve: "query"     # Options: "query", "facts", "random", "ave_fact"
+  update: "vanilla"     # Options: "vanilla", "validation", "reflect"
+
+traj_file_path: null    # Path to trajectory file (only needed for cold start)
+retrieve_num: 5
+memory_dir: "Alfworld/memory"
+memory_size: 1000

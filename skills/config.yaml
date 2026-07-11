@@ -1,0 +1,11 @@
+agent_name: "skills_agent"
+model_name: "Qwen/Qwen2.5-7B-Instruct"
+enable_thinking: false
+vllm: true
+thinking_budget: 1024
+max_new_tokens: 2048
+memory_root_dir: "memories"
+
+infer_with_full_memory: true
+external_model_url: http://10.202.0.8:5000
+api_key: EMPTY

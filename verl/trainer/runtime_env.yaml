@@ -1,0 +1,7 @@
+working_dir: /home/siruo_google_com/SkillCurator
+excludes: [".git/", "/__pycache__/", "*.pyc", "data", "flash_attn*", "ckpt", "converted_ckpt", "evaluation"]
+env_vars:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
+  PYTHONPATH: "/home/siruo_google_com/SkillCurator"
+  # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
+  # VLLM_ATTENTION_BACKEND: "XFORMERS"
