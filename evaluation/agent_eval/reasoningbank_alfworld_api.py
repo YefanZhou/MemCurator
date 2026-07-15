@@ -3,7 +3,9 @@ import re
 import json
 import logging
 from typing import Dict, List, Optional
-from vllm import SamplingParams
+# NOTE (_api): `from vllm import SamplingParams` is NOT imported at module top here — it is
+# imported lazily inside the local-vLLM branch of _llm(). This lets a pure-HTTP / external-gateway
+# curator import this module on a box without vllm installed.
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
@@ -30,6 +32,16 @@ _CUR_TOP_K    = _cur_int("CURATION_TOP_K", None)
 _CUR_MAX_TOK  = _cur_int("CURATION_MAX_TOKENS", 1024)   # prior default was 1024
 _CET          = os.environ.get("CURATION_ENABLE_THINKING", "")
 _CUR_THINKING = None if _CET == "" else (_CET.lower() in ("1", "true", "yes"))
+
+# _api: external-gateway curator switch. When CURATION_LLM_BACKEND=openai the vLLM-only extra_body
+# fields (top_k, chat_template_kwargs) are NOT sent, and the X-Api-Key header is attached if set.
+_CUR_EXTERNAL = (os.environ.get("CURATION_LLM_BACKEND", "vllm").lower() == "openai")
+_X_API_KEY    = os.environ.get("X_API_KEY") or None
+
+# Vertex (gemini/) creds — default to the Salesforce Vertex project (matches tests/test_api_model.py)
+# if the env vars are unset, so a gemini reasoningbank curator works without extra exports.
+_GCLOUD_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT")  or "salesforce-research-internal"
+_GCLOUD_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
 
 
 SUCCESSFUL_SI = """You are an expert in household task planning. You will be given a task and a trajectory representing how an agent successfully completed the task in a household environment.
@@ -112,6 +124,23 @@ class ReasoningBankAlfworld:
 
     def _llm(self, system: str, user: str) -> str:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        # gemini/ curator -> Vertex AI. ReasoningBank curation is plain text-in/text-out (the
+        # markdown memory items are parsed downstream), so no function-calling is needed here.
+        if self.curation_model_name and self.curation_model_name.startswith("gemini/"):
+            from google import genai
+            from google.genai import types
+            model_id = self.curation_model_name[len("gemini/"):]
+            client = genai.Client(vertexai=True, project=_GCLOUD_PROJECT, location=_GCLOUD_LOCATION)
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=user,
+                config=types.GenerateContentConfig(
+                    temperature=_CUR_TEMP,
+                    system_instruction=system,
+                    max_output_tokens=_CUR_MAX_TOK,
+                ),
+            )
+            return resp.text or ""
         if self.curation_base_url is not None:
             from litellm import completion
             # Was hardcoded: temperature=0.7, max_tokens=1024 (no top_p/top_k/thinking).
@@ -122,18 +151,23 @@ class ReasoningBankAlfworld:
                 api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
                 base_url=self.curation_base_url,
                 temperature=_CUR_TEMP,
-                max_tokens=_CUR_MAX_TOK,
                 num_retries=10,
             )
+            # gpt-5 family rejects `max_tokens` -> use `max_completion_tokens` when external.
+            kwargs["max_completion_tokens" if _CUR_EXTERNAL else "max_tokens"] = _CUR_MAX_TOK
             if _CUR_TOP_P is not None:
                 kwargs["top_p"] = _CUR_TOP_P
+            # extra_body (top_k, chat_template_kwargs) is vLLM-only; skip for external gateway.
             extra_body = {}
-            if _CUR_TOP_K is not None:
-                extra_body["top_k"] = _CUR_TOP_K
-            if _CUR_THINKING is not None:
-                extra_body["chat_template_kwargs"] = {"enable_thinking": _CUR_THINKING}
+            if not _CUR_EXTERNAL:
+                if _CUR_TOP_K is not None:
+                    extra_body["top_k"] = _CUR_TOP_K
+                if _CUR_THINKING is not None:
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": _CUR_THINKING}
             if extra_body:
                 kwargs["extra_body"] = extra_body
+            if _CUR_EXTERNAL and _X_API_KEY:
+                kwargs["extra_headers"] = {"X-Api-Key": _X_API_KEY}
             resp = completion(**kwargs)
             return resp.choices[0].message.content or ""
         if self.curation_tokenizer is not None:
@@ -146,6 +180,9 @@ class ReasoningBankAlfworld:
             )
         else:
             prompt = f"{system}\n\n{user}"
+        # Local vLLM path — import SamplingParams lazily here (not at module top) so a pure-HTTP
+        # / external-gateway curator can import this module without vllm installed.
+        from vllm import SamplingParams
         # Was hardcoded: SamplingParams(temperature=0.7, max_tokens=1024).
         # Now env-driven via CURATION_* knobs (max_tokens default kept at 1024).
         sp_kwargs = dict(temperature=_CUR_TEMP, max_tokens=_CUR_MAX_TOK)

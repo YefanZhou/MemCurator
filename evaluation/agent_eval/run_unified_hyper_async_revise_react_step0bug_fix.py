@@ -87,6 +87,75 @@ print(f"[executor hyperparams] temperature={EXECUTOR_TEMPERATURE} top_p={EXECUTO
       f"enable_thinking={ENABLE_THINKING} history_length={HISTORY_LENGTH}")
 
 # ------------------------------------------------------------------ #
+# Per-run config dump + self-logging (into the results folder)        #
+# This is a no-memory runner, so only executor/print knobs are tracked #
+# (no CURATION_*/PROMPT_STYLE/SAVE_RAW).                                #
+# ------------------------------------------------------------------ #
+_TRACKED_ENV_VARS = [
+    "OPENAI_API_BASE", "OPENAI_API_KEY", "ALFWORLD_DATA", "TMPDIR", "HISTORY_LENGTH",
+    "EXECUTOR_TEMPERATURE", "EXECUTOR_TOP_P", "EXECUTOR_TOP_K", "EXECUTOR_MAX_TOKENS",
+    "ENABLE_THINKING", "PROMPT_SHOW_EVERY", "PRINT_CHARS",
+]
+
+
+def dump_run_config(output_path, args, extra=None):
+    """Write run_config.json into output_path: CLI args + resolved executor hyperparams +
+    tracked env vars, so every result folder records exactly how it was produced. Masks key."""
+    def _mask(k, v):
+        return ("****" if v else v) if (v is not None and "KEY" in k) else v
+    cfg = {
+        "runner": os.path.basename(__file__),
+        "args": vars(args),
+        "resolved_hyperparams": {
+            "executor": {"temperature": EXECUTOR_TEMPERATURE, "top_p": EXECUTOR_TOP_P,
+                         "top_k": EXECUTOR_TOP_K, "max_tokens": EXECUTOR_MAX_TOKENS,
+                         "enable_thinking": ENABLE_THINKING, "history_length": HISTORY_LENGTH},
+            "print": {"prompt_show_every": PROMPT_SHOW_EVERY, "print_chars": PRINT_CHARS},
+        },
+        "env_vars": {k: _mask(k, os.environ.get(k)) for k in _TRACKED_ENV_VARS},
+    }
+    if extra:
+        cfg.update(extra)
+    os.makedirs(output_path, exist_ok=True)
+    with open(os.path.join(output_path, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    print(f"[run_config] wrote {output_path}/run_config.json")
+
+
+class _Tee:
+    """Duplicate a stream to a file, so all stdout/stderr also lands in the results folder
+    (replaces the need for an external `2>&1 | tee ...`). Flushes eagerly."""
+    def __init__(self, stream, fh):
+        self.stream, self.fh = stream, fh
+    def write(self, data):
+        self.stream.write(data)
+        self.fh.write(data)
+        self.fh.flush()
+    def flush(self):
+        self.stream.flush()
+        self.fh.flush()
+    # Delegate everything else (isatty, fileno, encoding, ...) to the real stream, so
+    # libraries that probe stdout (e.g. textworld calls sys.stdout.isatty() at import) work.
+    def isatty(self):
+        return getattr(self.stream, "isatty", lambda: False)()
+    def fileno(self):
+        return self.stream.fileno()
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def start_self_logging(output_path, filename="run.log"):
+    """Tee stdout+stderr into output_path/<filename>. Returns the open file handle (kept alive
+    for the process lifetime). Safe to combine with an external `| tee` (harmless dup)."""
+    os.makedirs(output_path, exist_ok=True)
+    log_path = os.path.join(output_path, filename)
+    fh = open(log_path, "a", encoding="utf-8", buffering=1)
+    sys.stdout = _Tee(sys.__stdout__, fh)
+    sys.stderr = _Tee(sys.__stderr__, fh)
+    print(f"[self-logging] stdout+stderr -> {log_path}")
+    return fh
+
+# ------------------------------------------------------------------ #
 # Prompt templates (identical to run_unified_hyper.py, ALFWorld)      #
 # ------------------------------------------------------------------ #
 
@@ -287,6 +356,11 @@ def main(args):
                 os.remove(os.path.join(output_path, f))
         print(f'Cleared existing results in {output_path}')
 
+    # Self-describing result folder: tee output into <output_path>/run.log and dump config.
+    # (After the overwrite-clear so run_config.json isn't deleted by the .json sweep above.)
+    start_self_logging(output_path)
+    dump_run_config(output_path, args)
+
     # --- build the base env (full game pool) once ---
     from alfworld.agents.environment import get_environment
     with open('Alfworld/base_config.yaml') as reader:
@@ -350,7 +424,8 @@ def main(args):
     total = 0
     rew = 0.0
     for f in os.listdir(output_path):
-        if f.endswith('.json'):
+        # Only per-game result files (idx_*.json) — NOT run_config.json / other sidecars.
+        if f.startswith('idx_') and f.endswith('.json'):
             total += 1
             rew += json.load(open(os.path.join(output_path, f)))['reward']
     print(f'\nFinal accuracy: {rew / max(total, 1) * 100:.2f}%  ({int(rew)}/{total})')
