@@ -1,4 +1,14 @@
 """
+run_unified_dev_async_curator.py  —  run_unified_dev_async.py + the MemCurator method.
+
+This is a COPY of run_unified_dev_async.py with one added memory method: 'curator'
+(MemCurator). No behavior of the existing methods (none/skillos/reasoningbank) is changed.
+Curator is ALFWorld-only, like reasoningbank. It also adds two CLI knobs
+(--context_header / --context_label) that control the injected-memory starter line, with
+per-method defaults that keep existing prompts byte-identical. See
+method_notes/CURATOR_INTEGRATION.md for the design and training-awareness notes.
+
+  --- original docstring below ---
 run_unified_dev_async.py  —  group episode-async variant of run_unified_dev.py.
 
 Same results as run_unified_dev.py with ANY memory method, but the ALFWorld loop runs
@@ -23,9 +33,9 @@ See bug_fix_markdown/DEV_HISTORY_RUNNER_LINEAGE.md for details.
 Supported combinations
 ----------------------
   --env         : alfworld | webshop | amc23 | aime24 | aime25 | gpqa
-  --memory_type : none | skillos | reasoningbank
+  --memory_type : none | skillos | reasoningbank | curator
 
-  Note: reasoningbank only supports alfworld.
+  Note: reasoningbank and curator only support alfworld.
         Reasoning envs (amc23/aime24/aime25/gpqa) ignore --memory_type.
 
 Example commands
@@ -452,7 +462,7 @@ Once you've finished your reasoning, you should choose an admissible action for 
 ALFWORLD_TEMPLATE_NO_HIS_WITH_CONTEXT = """\
 You are an expert agent operating in the ALFRED Embodied Environment.
 
-## Past Relevant {context_label}
+{context_header}
 
 {retrieved_context}
 
@@ -480,7 +490,7 @@ Once you've finished your reasoning, you should choose an admissible action for 
 ALFWORLD_TEMPLATE_WITH_CONTEXT = """\
 You are an expert agent operating in the ALFRED Embodied Environment. Your task is to: {task_description}
 
-## Past Relevant {context_label}
+{context_header}
 
 {retrieved_context}
 
@@ -753,12 +763,29 @@ def get_reasoningbank_text(bank, query: str, retrieve_num: int) -> str:
     return result if result else ""
 
 
-def retrieve_context(memory_type, memory_obj, query: str, retrieve_num: int) -> str:
-    """Unified retrieval: returns context string (empty if none)."""
+def get_curator_text(curator, query: str, retrieve_num: int, curator_question: str = None) -> str:
+    """Retrieve from CuratorAlfworld: BM25 retrieve (on `query`) + LLM-curate into a briefing.
+
+    curator_question (if given) is the CURRENT-task "Question:" shown to the curator LLM;
+    BM25 still keys on `query`. Lets --task_context obs0 enrich only the user turn.
+    """
+    result = curator.retrieve(query, retrieve_num, curator_question=curator_question)
+    return result if result else ""
+
+
+def retrieve_context(memory_type, memory_obj, query: str, retrieve_num: int,
+                     curator_question: str = None) -> str:
+    """Unified retrieval: returns context string (empty if none).
+
+    curator_question is curator-only (the enriched CURRENT-task Question for the user turn);
+    skillos / reasoningbank ignore it and key on `query` as before.
+    """
     if memory_type == 'skillos':
         return get_skillos_text(memory_obj, query, retrieve_num)
     elif memory_type == 'reasoningbank':
         return get_reasoningbank_text(memory_obj, query, retrieve_num)
+    elif memory_type == 'curator':
+        return get_curator_text(memory_obj, query, retrieve_num, curator_question=curator_question)
     return ""
 
 
@@ -785,12 +812,14 @@ def load_skills(skill_memory: SkillMemory, storage_path: str):
 
 def alfworld_run_batch(env, obs, names, task_descriptions, admissible_commands,
                        max_steps=30, model="openai/Qwen/Qwen2.5-7B-Instruct",
-                       skills_context=None, context_label="Skills"):
+                       skills_context=None, context_label="Skills",
+                       context_header="## Past Relevant Skills"):
     """
     Run a batch of ALFWorld tasks.
 
     skills_context : dict mapping game index -> retrieved context text (empty = no injection)
     context_label  : section heading used in the with-context template ("Skills" or "Memories")
+    context_header : full starter line for the injected-memory block (overrides the heading)
     """
     n = len(obs)
     histories = [[] for _ in range(n)]
@@ -823,6 +852,7 @@ def alfworld_run_batch(env, obs, names, task_descriptions, admissible_commands,
                     # Step-0 context injection (mirrors run_memp_ori.py): memory guidance
                     # is available for the FIRST action, not only from step 1+.
                     prompt_text = ALFWORLD_TEMPLATE_NO_HIS_WITH_CONTEXT.format(
+                        context_header=context_header,
                         retrieved_context=ctx_text,
                         context_label=context_label,
                         context_label_lower=context_label.lower(),
@@ -837,6 +867,7 @@ def alfworld_run_batch(env, obs, names, task_descriptions, admissible_commands,
             elif ctx_text:
                 prompt_text = ALFWORLD_TEMPLATE_WITH_CONTEXT.format(
                     task_description=task_descriptions[idx],
+                    context_header=context_header,
                     retrieved_context=ctx_text,
                     context_label=context_label,
                     context_label_lower=context_label.lower(),
@@ -941,7 +972,8 @@ def alfworld_run_batch(env, obs, names, task_descriptions, admissible_commands,
 # ------------------------------------------------------------------ #
 
 def run_one_game(game_file, game_idx, model, max_steps,
-                 task_description, ctx_text="", context_label="Skills"):
+                 task_description, ctx_text="", context_label="Skills",
+                 context_header="## Past Relevant Skills"):
     """Run ONE pinned ALFWorld game to completion, concurrently with others in its group.
 
     Order/grouping/task/ctx come from the SHARED batched env.reset() stream in main() (the
@@ -980,6 +1012,7 @@ def run_one_game(game_file, game_idx, model, max_steps,
         if step_count == 0:
             if ctx_text:
                 prompt_text = ALFWORLD_TEMPLATE_NO_HIS_WITH_CONTEXT.format(
+                    context_header=context_header,
                     retrieved_context=ctx_text,
                     context_label=context_label,
                     context_label_lower=context_label.lower(),
@@ -994,6 +1027,7 @@ def run_one_game(game_file, game_idx, model, max_steps,
         elif ctx_text:
             prompt_text = ALFWORLD_TEMPLATE_WITH_CONTEXT.format(
                 task_description=task_description,
+                context_header=context_header,
                 retrieved_context=ctx_text,
                 context_label=context_label,
                 context_label_lower=context_label.lower(),
@@ -1490,13 +1524,10 @@ def run_reasoning(problems, model, batch_size, output_path, finished, env_name='
 # SkillOS curation                                                    #
 # ------------------------------------------------------------------ #
 
-def execute_tool(skill_memory: SkillMemory, tool_name: str, arguments: dict, task: str = None) -> dict:
-    # `task` = the CURRENT task description that produced this curation op; passed to
-    # insert/update so the skill records its originating task(s) as the BM25 retrieval
-    # key (Option B: RB/Curator-aligned task<->task retrieval). None => legacy behavior.
+def execute_tool(skill_memory: SkillMemory, tool_name: str, arguments: dict) -> dict:
     if tool_name == "new_skill_insert":
         try:
-            title = skill_memory.new_memory_insert(arguments["skill_name"], arguments["content"], task=task)
+            title = skill_memory.new_memory_insert(arguments["skill_name"], arguments["content"])
             return {"status": "ok", "message": "Skill created.", "skill_name": title}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -1506,7 +1537,6 @@ def execute_tool(skill_memory: SkillMemory, tool_name: str, arguments: dict, tas
                 title=arguments["skill_name"],
                 new_name=arguments.get("new_name"),
                 new_content=arguments.get("new_content"),
-                task=task,
             )
             return {"status": "ok", "message": "Skill updated.", "updated_skill": updated}
         except Exception as e:
@@ -1649,14 +1679,46 @@ Your output must contain the following sections:
     return dict_messages
 
 
+def _build_curation_prompt(skill_memory: SkillMemory, curation_tokenizer,
+                            task: str, messages: list, reward: bool,
+                            retrieved_skills_text: str) -> str:
+    """Tokenize curation messages into a raw string for local vLLM inference."""
+    dict_messages = _build_curation_messages(
+        skill_memory, task, messages, reward, retrieved_skills_text
+    )
+    return curation_tokenizer.apply_chat_template(
+        dict_messages, tokenize=False, add_generation_prompt=True
+    )
+
+
+def _apply_parsed_function_calls(skill_memory: SkillMemory, function_calls: list, label: str = ""):
+    """Execute already-parsed function calls (list of {name, arguments-as-JSON-string}).
+    Shared by the Qwen-token path (_apply_curation_output) and the native tool-calls path."""
+    print(function_calls)
+    for fc in function_calls:
+        try:
+            arguments = json.loads(fc["arguments"]) or {}
+        except json.JSONDecodeError:
+            try:
+                arguments = json.loads(fc["arguments"].replace('\n', '\\n').replace('\r', '\\r')) or {}
+            except json.JSONDecodeError:
+                arguments = {}
+        result = execute_tool(skill_memory, fc["name"], arguments)
+        print(f"[SkillCuration{label}] {fc['name']}({arguments.get('skill_name', '')}) "
+              f"-> {result['status']}: {result.get('message', '')}")
+
+
+def _apply_curation_output(skill_memory: SkillMemory, raw: str, label: str = ""):
+    """Qwen-token path: parse ✿FUNCTION✿ tokens from raw text, then apply."""
+    function_calls, _ = _parse_function_calls_from_text(raw)
+    _apply_parsed_function_calls(skill_memory, function_calls, label)
+
+
 def _build_curation_messages_plain(skill_memory: SkillMemory,
                                     task: str, messages: list, reward: bool,
                                     retrieved_skills_text: str) -> list:
-    """Build PLAIN chat messages for native OpenAI tool-calling (no Qwen ✿-token preprocessing).
-
-    Same system prompt + user content as _build_curation_messages, but the tool schemas are passed
-    separately as the `tools=` arg (see curation_llm_native), not encoded into the text. Mirrors the
-    native branch of SkillOS/skills_agent.py (is_qwen==False)."""
+    """PLAIN chat messages for native OpenAI/Vertex tool-calling (no Qwen ✿-token preprocessing).
+    Tool schemas are passed separately via tools=; mirrors SkillOS/skills_agent.py (is_qwen==False)."""
     trajectory_text = trajectory_to_text(messages)
     result_str = "Success" if reward else "Failure"
     system_messages = skill_memory.render_system_prompt(status='memorie')
@@ -1690,11 +1752,8 @@ Your output must contain the following sections:
 
 
 def curation_llm_native(messages: list, curation_model: str, curation_base_url: str):
-    """Native OpenAI tool-calling curation for external (non-Qwen) models via the gateway.
-
-    Passes MEMORY_TOOL_SCHEMAS as `tools=` and returns the parsed function calls as a list of
-    {name, arguments(JSON str)} — the shape _apply_parsed_function_calls expects. No ✿-token
-    encoding/parsing (GPT/Gemini never emit those). Mirrors SkillOS/skills_agent.py:366-402."""
+    """Native OpenAI tool-calling curation for external (non-Qwen) skillos curators via the gateway.
+    Returns [{name, arguments(JSON str)}] — the shape _apply_parsed_function_calls expects."""
     kwargs = dict(
         model=curation_model,
         messages=messages,
@@ -1711,22 +1770,15 @@ def curation_llm_native(messages: list, curation_model: str, curation_base_url: 
     _hdrs = _gateway_extra_headers()
     if _hdrs:
         kwargs["extra_headers"] = _hdrs
-
     response = _completion_with_temp_fallback(**kwargs)
     msg = response.choices[0].message
     tool_calls = getattr(msg, "tool_calls", None) or []
-    parsed = []
-    for tc in tool_calls:
-        fn = tc.function
-        parsed.append({"name": fn.name, "arguments": fn.arguments or "{}"})
-    return parsed
+    return [{"name": tc.function.name, "arguments": tc.function.arguments or "{}"}
+            for tc in tool_calls]
 
 
 def curation_vertex_native(messages: list, curation_model: str):
     """Native Vertex AI (gemini/) function-calling curation for skillos.
-
-    Vertex equivalent of curation_llm_native: passes MEMORY_TOOL_SCHEMAS as a Vertex Tool and
-    reads response.function_calls (Gemini emits real function calls, never Qwen ✿-tokens).
     Returns [{name, arguments(JSON str)}] — the shape _apply_parsed_function_calls expects."""
     from google.genai import types
     model_id = curation_model[len("gemini/"):] if curation_model.startswith("gemini/") else curation_model
@@ -1738,55 +1790,16 @@ def curation_vertex_native(messages: list, curation_model: str):
         system_instruction=system_msg,
         tools=[_openai_tools_to_vertex(MEMORY_TOOL_SCHEMAS)],
     )
-    if CURATION_MAX_TOKENS is not None:            # bound the curator output (Vertex: max_output_tokens)
+    if CURATION_MAX_TOKENS is not None:
         _cfg["max_output_tokens"] = CURATION_MAX_TOKENS
     response = client.models.generate_content(
-        model=model_id,
-        contents=user_text,
-        config=types.GenerateContentConfig(**_cfg),
+        model=model_id, contents=user_text, config=types.GenerateContentConfig(**_cfg),
     )
     parsed = []
     for fc in (getattr(response, "function_calls", None) or []):
         args = dict(fc.args) if fc.args else {}
         parsed.append({"name": fc.name, "arguments": json.dumps(args)})
     return parsed
-
-
-def _build_curation_prompt(skill_memory: SkillMemory, curation_tokenizer,
-                            task: str, messages: list, reward: bool,
-                            retrieved_skills_text: str) -> str:
-    """Tokenize curation messages into a raw string for local vLLM inference."""
-    dict_messages = _build_curation_messages(
-        skill_memory, task, messages, reward, retrieved_skills_text
-    )
-    return curation_tokenizer.apply_chat_template(
-        dict_messages, tokenize=False, add_generation_prompt=True
-    )
-
-
-def _apply_parsed_function_calls(skill_memory: SkillMemory, function_calls: list, label: str = "", task: str = None):
-    """Execute already-parsed function calls (list of {name, arguments-as-JSON-string}).
-    Shared by the Qwen-token path (_apply_curation_output) and the native tool-calls path.
-    `task` = current task description; forwarded to execute_tool so inserted/updated
-    skills record their originating task as the BM25 retrieval key (Option B)."""
-    print(function_calls)
-    for fc in function_calls:
-        try:
-            arguments = json.loads(fc["arguments"]) or {}
-        except json.JSONDecodeError:
-            try:
-                arguments = json.loads(fc["arguments"].replace('\n', '\\n').replace('\r', '\\r')) or {}
-            except json.JSONDecodeError:
-                arguments = {}
-        result = execute_tool(skill_memory, fc["name"], arguments, task=task)
-        print(f"[SkillCuration{label}] {fc['name']}({arguments.get('skill_name', '')}) "
-              f"-> {result['status']}: {result.get('message', '')}")
-
-
-def _apply_curation_output(skill_memory: SkillMemory, raw: str, label: str = "", task: str = None):
-    """Qwen-token path: parse ✿FUNCTION✿ tokens from raw text, then apply."""
-    function_calls, _ = _parse_function_calls_from_text(raw)
-    _apply_parsed_function_calls(skill_memory, function_calls, label, task=task)
 
 
 def curation_llm(messages: list, curation_model: str, curation_base_url: str) -> str:
@@ -1854,15 +1867,12 @@ def batch_update_skills_from_trajectories(
 ):
     is_gemini = curation_model is not None and curation_model.startswith("gemini/")
     use_http = curation_base_url is not None or _CUR_EXTERNAL or is_gemini
-    # Native tool-calling path: external OpenAI gateway (GPT) OR Vertex (gemini/). Both emit real
-    # function calls (never Qwen ✿-tokens), so both use PLAIN messages + MEMORY_TOOL_SCHEMAS and
-    # return the {name, arguments} shape _apply_parsed_function_calls expects. Only the per-item
-    # call fn differs: curation_vertex_native (Vertex) vs curation_llm_native (litellm gateway).
+    # Native tool-calling path: external gateway (GPT, _CUR_EXTERNAL) OR Vertex (gemini/). Both emit
+    # real function calls (never Qwen ✿-tokens) -> PLAIN messages + tools=, parse tool_calls.
     use_native_fc = _CUR_EXTERNAL or is_gemini
 
     if use_http and use_native_fc:
-        _native_call = (curation_vertex_native if is_gemini
-                        else curation_llm_native)
+        _native_call = curation_vertex_native if is_gemini else curation_llm_native
         all_messages = []
         for task, messages, reward, retrieved_skills_text in batch_data:
             try:
@@ -1879,7 +1889,6 @@ def batch_update_skills_from_trajectories(
             return
 
         def _call(i):
-            # Vertex fn takes (messages, model); gateway fn takes (messages, model, base_url).
             if is_gemini:
                 return _native_call(all_messages[i], curation_model)
             return _native_call(all_messages[i], curation_model, curation_base_url)
@@ -1896,8 +1905,7 @@ def batch_update_skills_from_trajectories(
 
         for i in valid_indices:
             if parsed_calls[i]:
-                # batch_data[i] = (task, messages, reward, retrieved_skills_text); pass task for Option-B keying.
-                _apply_parsed_function_calls(skill_memory, parsed_calls[i], label=f" game={i}", task=batch_data[i][0])
+                _apply_parsed_function_calls(skill_memory, parsed_calls[i], label=f" game={i}")
 
     elif use_http:
         # Build preprocessed message lists for each item
@@ -1932,8 +1940,7 @@ def batch_update_skills_from_trajectories(
 
         for i in valid_indices:
             if raw_outputs[i]:
-                # batch_data[i] = (task, messages, reward, retrieved_skills_text); pass task for Option-B keying.
-                _apply_curation_output(skill_memory, raw_outputs[i], label=f" game={i}", task=batch_data[i][0])
+                _apply_curation_output(skill_memory, raw_outputs[i], label=f" game={i}")
 
     else:
         # Local vLLM path
@@ -1974,8 +1981,7 @@ def batch_update_skills_from_trajectories(
 
         for orig_idx, output in zip(valid_indices, outputs):
             raw = output.outputs[0].text
-            # batch_data[orig_idx] = (task, messages, reward, retrieved_skills_text); pass task for Option-B keying.
-            _apply_curation_output(skill_memory, raw, label=f" game={orig_idx}", task=batch_data[orig_idx][0])
+            _apply_curation_output(skill_memory, raw, label=f" game={orig_idx}")
 
 
 # ------------------------------------------------------------------ #
@@ -1996,14 +2002,13 @@ def init_memory(args, storage_path, env_name='alfworld'):
 
     is_reasoning_env = env_name in REASONING_ENVS
     use_gemini_curator = args.curation_model.startswith("gemini/")
-    # _CUR_EXTERNAL (CURATION_LLM_BACKEND=openai) forces the HTTP/native path even if no
-    # --curation_base_url is given (it falls back to OPENAI_API_BASE = the gateway).
+    # _CUR_EXTERNAL (CURATION_LLM_BACKEND=openai) forces the HTTP/native path even without
+    # --curation_base_url (it falls back to OPENAI_API_BASE = the gateway).
     use_http = bool(getattr(args, 'curation_base_url', None)) or _CUR_EXTERNAL or use_gemini_curator
 
-    # SkillOS needs QwenFnCallPrompt + Qwen tokenizer ONLY for the ✿-token curation path.
-    # The native tool-calling paths — external gateway (_CUR_EXTERNAL) AND Vertex gemini/ — use
-    # plain messages + tools=, so they need neither. Skip the Qwen load for both, so a GPT/Gemini
-    # curator has no Qwen dependency.
+    # SkillOS needs QwenFnCallPrompt + Qwen tokenizer ONLY for the ✿-token curation path. The native
+    # tool-calling paths (external gateway _CUR_EXTERNAL, or Vertex gemini/) use plain messages +
+    # tools=, so skip the Qwen load for both -> a GPT/Gemini skillos curator has no Qwen dependency.
     if args.memory_type == 'skillos' and not (_CUR_EXTERNAL or use_gemini_curator):
         global AutoTokenizer, QwenFnCallPrompt, Message, ContentItem
         from transformers import AutoTokenizer as _AutoTokenizer
@@ -2018,11 +2023,11 @@ def init_memory(args, storage_path, env_name='alfworld'):
     if use_http:
         curation_model_hf = None
         if use_gemini_curator:
-            print(f"Curation via Vertex AI (native tool-calls for skillos): {args.curation_model} "
+            print(f"Curation via Vertex AI: {args.curation_model} "
                   f"@ project={GCLOUD_PROJECT} location={GCLOUD_LOCATION}")
         elif _CUR_EXTERNAL:
             _cb = getattr(args, 'curation_base_url', None) or os.environ.get("OPENAI_API_BASE")
-            print(f"Curation via external gateway (native tool-calls): {args.curation_model} @ {_cb}")
+            print(f"Curation via external gateway: {args.curation_model} @ {_cb}")
         else:
             print(f"Curation via HTTP: {args.curation_model} @ {args.curation_base_url}")
     else:
@@ -2073,6 +2078,22 @@ def init_memory(args, storage_path, env_name='alfworld'):
             print(f"ReasoningBankAlfworld ({'HTTP' if use_http else 'vLLM'}) initialised at {storage_path}")
         return bank, curation_tokenizer, curation_model_hf
 
+    elif args.memory_type == 'curator':
+        # MemCurator — ALFWorld only (like reasoningbank). Same curation plumbing:
+        # the read-time curator LLM is swappable via --curation_model / --curation_base_url.
+        from curator_alfworld_api import CuratorAlfworld
+        curator = CuratorAlfworld(
+            storage_path=storage_path,
+            curation_model_hf=curation_model_hf,
+            curation_tokenizer=curation_tokenizer,
+            retrieve_num=args.retrieve_num,
+            curation_model_name=args.curation_model,
+            curation_base_url=curation_base_url,
+            curator_on_empty=getattr(args, 'curator_on_empty', False),
+        )
+        print(f"CuratorAlfworld ({'HTTP' if use_http else 'vLLM'}) initialised at {storage_path}")
+        return curator, curation_tokenizer, curation_model_hf
+
     raise ValueError(f"Unknown memory_type: {args.memory_type}")
 
 
@@ -2118,6 +2139,18 @@ def update_memory_after_batch(
             )
         # ReasoningBankAlfworld persists internally via its storage_path
 
+    elif memory_type == 'curator':
+        for result, task_desc in zip(batch_results, task_descriptions):
+            task_id = result.get('name', task_desc[:40]).replace('/', '_')
+            # Curator stores only successful trajectories (add() no-ops on failure).
+            memory_obj.add(
+                task_id=task_id,
+                task=task_desc,
+                messages=result['messages'],
+                reward=bool(result['reward']),
+            )
+        # CuratorAlfworld persists internally via its storage_path
+
 
 # ------------------------------------------------------------------ #
 # Main                                                                #
@@ -2140,10 +2173,15 @@ def main(args):
 
     # Memory now lives INSIDE the result folder (self-contained run: idx_*.json,
     # run_config.json, run.log, and the memory store all in one place).
-    skills_storage_path = os.path.join(
-        output_path,
-        'skills.json' if memory_type == 'skillos' else 'reasoning_bank.jsonl'
-    )
+    # curator uses curator_memory.jsonl (read-time transcripts land beside it as
+    # curator_calls.jsonl).
+    if memory_type == 'skillos':
+        _mem_file = 'skills.json'
+    elif memory_type == 'curator':
+        _mem_file = 'curator_memory.jsonl'
+    else:
+        _mem_file = 'reasoning_bank.jsonl'
+    skills_storage_path = os.path.join(output_path, _mem_file)
 
     os.makedirs(output_path, exist_ok=True)
 
@@ -2184,8 +2222,8 @@ def main(args):
         return
 
     # ---- Validate memory_type / env combination (alfworld / webshop) ----
-    if memory_type == 'reasoningbank' and args.env != 'alfworld':
-        print(f"[WARNING] ReasoningBank only supports ALFWorld for interactive tasks; "
+    if memory_type in ('reasoningbank', 'curator') and args.env != 'alfworld':
+        print(f"[WARNING] {memory_type} only supports ALFWorld for interactive tasks; "
               f"env='{args.env}' will run WITHOUT memory.")
         memory_type = 'none'
 
@@ -2194,8 +2232,17 @@ def main(args):
         args, skills_storage_path, env_name=args.env
     )
 
-    # ---- Context label for prompt templates ----
-    context_label = "Skills" if memory_type == 'skillos' else "Memories"
+    # ---- Injected-memory starter (heading/preamble) + label for prompt templates ----
+    # Per-method defaults keep existing prompts byte-identical; --context_header /
+    # --context_label override them when provided.
+    _DEFAULT_LABELS  = {'skillos': 'Skills', 'reasoningbank': 'Memories', 'curator': 'experiences'}
+    _DEFAULT_HEADERS = {
+        'skillos':       '## Past Relevant Skills',
+        'reasoningbank': '## Past Relevant Memories',
+        'curator':       'Here are past experiences and trajectories that might be helpful for your decision:',
+    }
+    context_label  = args.context_label  if getattr(args, 'context_label', None)  else _DEFAULT_LABELS.get(memory_type, 'Memories')
+    context_header = args.context_header if getattr(args, 'context_header', None) else _DEFAULT_HEADERS.get(memory_type, f'## Past Relevant {context_label}')
 
     # ---- Resume accounting ----
     finished_games = 0
@@ -2241,26 +2288,37 @@ def main(args):
             name_list = ['/'.join(gf.split('/')[-3:-1]) for gf in game_file_list]
             real_n = len(ob_list)
 
+            # BM25 retrieval key AND stored "task" are ALWAYS the short task description
+            # (kept short so retrieval matches on task type and past-task Questions stay short).
+            # --task_context obs0 enriches ONLY the curator's CURRENT-task "Question:" (the
+            # user turn) with the step-0 room observation — it does not touch retrieval/storage.
+            if getattr(args, 'task_context', 'short') == 'obs0':
+                # room+task chunk == what run_one_game injects at step 0 ('\n\n'[1:] slice)
+                curator_questions = ['\n'.join(ob.split('\n\n')[1:]) for ob in ob_list]
+            else:
+                curator_questions = task_descriptions
+
             # --- retrieve context for each game (single-threaded, frozen pre-group snapshot) ---
             skills_context = {}
             if memory_obj is not None:
                 for i, query in enumerate(task_descriptions):
-                    ctx = retrieve_context(memory_type, memory_obj, query, args.retrieve_num)
+                    ctx = retrieve_context(memory_type, memory_obj, query, args.retrieve_num,
+                                           curator_question=curator_questions[i])
                     if ctx:
                         skills_context[i] = ctx
 
             # --- run the group's games CONCURRENTLY to completion (barrier at with-block exit) ---
             # keyed by position i in the group (0..real_n-1), matching batch semantics.
-            # MAX_CONCURRENCY (optional) caps in-flight threads for gateway rate limits; it never
-            # exceeds group_size, so the memory-group barrier is preserved (games still all finish
-            # before the post-group update).
+            # MAX_CONCURRENCY (optional) caps in-flight threads for API rate limits; <= group_size so
+            # the memory-group barrier is preserved (games still all finish before the post-group update).
             _workers = min(group_size, MAX_CONCURRENCY) if MAX_CONCURRENCY else group_size
             results_by_pos = {}
             with ThreadPoolExecutor(max_workers=_workers) as pool:
                 futures = {
                     pool.submit(run_one_game, game_file_list[i], idx * group_size + i,
                                 model_name, args.max_steps,
-                                task_descriptions[i], skills_context.get(i, ""), context_label): i
+                                task_descriptions[i], skills_context.get(i, ""),
+                                context_label, context_header): i
                     for i in range(real_n)
                 }
                 for fut in as_completed(futures):
@@ -2300,6 +2358,8 @@ def main(args):
             print(f'Finished {idx * group_size + real_n} games')
 
             # --- memory update at the group barrier (in group-position order) ---
+            # Store the SHORT task_descriptions (== the BM25 key), regardless of
+            # --task_context, so retrieval and stored past-task Questions stay aligned.
             update_memory_after_batch(
                 memory_type, memory_obj,
                 curation_tokenizer, curation_model_hf,
@@ -2430,7 +2490,7 @@ if __name__ == '__main__':
                         choices=['alfworld', 'webshop', 'amc23', 'aime24', 'aime25', 'gpqa'],
                         help='Task environment')
     parser.add_argument('--memory_type',    type=str,  default='none',
-                        choices=['none', 'skillos', 'reasoningbank'],
+                        choices=['none', 'skillos', 'reasoningbank', 'curator'],
                         help='Memory mechanism to use')
     parser.add_argument('--split',          type=str,  default='dev',
                         choices=['dev', 'test', 'train'],
@@ -2446,7 +2506,27 @@ if __name__ == '__main__':
     parser.add_argument('--retrieve_num',   type=int,  default=3,
                         help='Number of memory items to retrieve per query')
     parser.add_argument('--curation_model', type=str,  default='Qwen/Qwen3-8B',
-                        help='Model name for memory curation (skillos / reasoningbank)')
+                        help='Model name for memory curation (skillos / reasoningbank / curator)')
+    parser.add_argument('--context_header', type=str, default=None,
+                        help='Override the starter line of the injected-memory block (any '
+                             'text, may be multi-line). Default is per memory_type: '
+                             '"## Past Relevant Skills/Memories" for skillos/reasoningbank, '
+                             'and the curator preamble for curator.')
+    parser.add_argument('--context_label',  type=str, default=None,
+                        help='Override the noun used in the "with the help of past relevant '
+                             '<label>" instruction. Default per memory_type: Skills / '
+                             'Memories / experiences.')
+    parser.add_argument('--curator_on_empty', action='store_true',
+                        help='(curator only) Call the curator LLM to produce a briefing even '
+                             'when retrieval returns nothing (empty/cold store). Default OFF: '
+                             'empty retrieval -> no LLM call, no briefing (the Q2 behavior).')
+    parser.add_argument('--task_context', type=str, default='short',
+                        choices=['short', 'obs0'],
+                        help='(curator only) What the curator LLM sees as the CURRENT-task '
+                             '"Question:" in its user turn. "short" = task description only '
+                             '(e.g. "put X on Y"); "obs0" = task + the step-0 room observation. '
+                             'Does NOT change the BM25 retrieval key or the stored records '
+                             '(those stay the short task), only the curator user turn.')
     parser.add_argument('--curation_base_url', type=str, default=None,
                         help='OpenAI-compatible API base URL for curation model. '
                              'When set, uses the API instead of loading vLLM locally.')

@@ -158,14 +158,14 @@ run_exp() {
 # Job matrix — 12 reasoningbank runs: think{2} x hist{2} x seed{3}.
 # Priority: thinking first (headline), then nonthinking; hist5 before hist3 within each.
 # Job spec: thinking|hist|exp_name
+ # "true|5|rb32-async_think_hist5_run1"
+ # "true|5|rb32-async_think_hist5_run2"
+ # "true|5|rb32-async_think_hist5_run3"
+ # "true|3|rb32-async_think_hist3_run1"
+ # "true|3|rb32-async_think_hist3_run2"
+ # "true|3|rb32-async_think_hist3_run3"
 # ==============================================================================
 BASE=(
-  "true|5|rb32-async_think_hist5_run1"
-  "true|5|rb32-async_think_hist5_run2"
-  "true|5|rb32-async_think_hist5_run3"
-  "true|3|rb32-async_think_hist3_run1"
-  "true|3|rb32-async_think_hist3_run2"
-  "true|3|rb32-async_think_hist3_run3"
   "false|5|rb32-async_nonthink_hist5_run1"
   "false|5|rb32-async_nonthink_hist5_run2"
   "false|5|rb32-async_nonthink_hist5_run3"

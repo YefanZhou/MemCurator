@@ -219,8 +219,15 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
     # --------------------------------------------------
     # Memory operations – called by functions.py
     # --------------------------------------------------
-    def new_memory_insert(self, title: str, content: str) -> str:
-        """Insert a new skill. Raises ValueError if title already exists."""
+    def new_memory_insert(self, title: str, content: str, task: str = None) -> str:
+        """Insert a new skill. Raises ValueError if title already exists.
+
+        `task` (optional): the CURRENT task description that produced this skill.
+        Stored ONCE in skill['tasks'] as the FROZEN BM25 retrieval key (Option B, to
+        align with ReasoningBank/MemCurator task<->task retrieval, whose key is also
+        write-once). Never grows: memory_update deliberately does not append to it.
+        Optional so all legacy callers that pass only (title, content) keep working
+        (those skills fall back to description/body indexing in _retrieval_doc)."""
         if self._skill_exists_by_title(title):
             raise ValueError(f"Skill with title '{title}' already exists.")
 
@@ -228,6 +235,8 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
         #     raise ValueError(f"Content does not meet YAML format requirements.")
 
         new_skill = {'title': title, 'content': content}
+        if task:
+            new_skill['tasks'] = [str(task).strip()]
         self.skills.append(new_skill)
 
         # Generate and store embedding for the new skill
@@ -243,8 +252,19 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
 
         return title
 
-    def memory_update(self, title: str, new_name: str = None, new_content: str = None) -> Dict[str, str]:
-        """Update a skill's title and/or content by its title."""
+    def memory_update(self, title: str, new_name: str = None, new_content: str = None, task: str = None) -> Dict[str, str]:
+        """Update a skill's title and/or content by its title.
+
+        `task` (optional): the CURRENT task description driving this update. Accepted
+        for signature symmetry with new_memory_insert, but by design it is NOT written
+        into skill['tasks'] — the retrieval KEY is FROZEN at the skill's creation task,
+        immutable exactly like ReasoningBank's record["query"] (set once at add()).
+        Rationale: an accumulating task-bag key made frequently-updated generic skills
+        (e.g. "Place Object in Container") match almost any query and dominate BM25
+        retrieval (observed in the fix smoke run). RB/Curator never mutate a key: each
+        past experience is a SEPARATE append-only record with one frozen task. Freezing
+        the key here is the closest single-entry analogue. Only content/title mutate on
+        update; the task-key does not."""
         if not new_name and not new_content:
             raise ValueError("Either new_name or new_content must be provided for update.")
         # if new_content and evaluate_yaml_format(new_content) == 0.0:
@@ -267,6 +287,16 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
 
         if new_content:
             skill_to_update['content'] = new_content
+
+        # KEY FROZEN AT CREATION: intentionally do NOT touch skill['tasks'] on update
+        # (see docstring). `task` is unused here on purpose.
+        # OLD (accumulating key — caused generic skills to dominate retrieval):
+        #   if task:
+        #       t = str(task).strip()
+        #       tasks = skill_to_update.get('tasks') or []
+        #       if t and t not in tasks: tasks.append(t)
+        #       skill_to_update['tasks'] = tasks
+        _ = task  # accepted but intentionally not written into the key
 
         # Update embedding
         embedding_text = f"Title: {skill_to_update['title']}\nContent: {skill_to_update['content']}"
@@ -310,6 +340,55 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
         tokens = re.findall(r'\b\w+\b', text.lower())
         return tokens
 
+    def _retrieval_doc(self, skill: Dict[str, str]) -> str:
+        """Text a skill is INDEXED on for BM25 retrieval.
+
+        RETRIEVAL-ALIGNMENT (Option B): to match ReasoningBank / MemCurator — which
+        index BM25 over `record["query"]` = the past TASK DESCRIPTION and thus do
+        task<->task matching — SkillOS indexes each skill over the TASK DESCRIPTION
+        that CREATED it (skill['tasks'], frozen at creation; see memory_update for why
+        it is not grown on update). This makes a current task retrieve skills distilled
+        from similar past tasks, rather than matching the task string against generic
+        skill-body procedural tokens. Normally a single-element list, so the join is
+        one task string ~= RB's record["query"].
+
+        Fallbacks (older skills / callers that didn't pass a task):
+          1. no tasks recorded -> title + YAML `description` ("when to use" key)
+          2. no parseable frontmatter -> title + full content (still retrievable)
+
+        History of this method:
+          v0 (original): f"{title} {content}"        # full markdown body -> low precision
+          v1 (fix#1)   : f"{title} {description}"    # title + description -> no gain in A/B
+          v2 (fix#1-B) : task keys (this version)    # align w/ RB/Curator task<->task
+        To revert to v0, return f"{skill.get('title','')} {skill.get('content','')}".
+        """
+        title = skill.get("title", "") or ""
+        content = skill.get("content", "") or ""
+
+        # v2: index over the originating task description(s) — matches RB/Curator.
+        tasks = skill.get("tasks") or []
+        if isinstance(tasks, str):
+            tasks = [tasks]
+        tasks = [str(t).strip() for t in tasks if str(t).strip()]
+        if tasks:
+            return " ".join(tasks)
+
+        # v1 fallback: title + YAML description ("when to use").
+        desc = None
+        m = re.search(r'^---\s*\n(.*?)\n---\s*', content.strip(), re.DOTALL)
+        if m:
+            try:
+                meta = yaml.safe_load(m.group(1))
+                if isinstance(meta, dict) and meta.get("description"):
+                    desc = str(meta["description"])
+            except yaml.YAMLError:
+                desc = None
+        if desc is not None:
+            return f"{title} {desc}"
+
+        # v0 fallback: malformed frontmatter -> full body.
+        return f"{title} {content}"
+
     def memory_search(self, query: str, top_k: int = None, min_score: float = 0.0, search_method: str = "bm25") -> List[Tuple[Dict[str, str], float]]:
         """Search for skills using BM25 or text embedding similarity.
         
@@ -339,8 +418,11 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
             return []
         
         # Tokenize all documents (skills)
-        tokenized_corpus = [self._tokenize(f"{skill['title']} {skill['content']}") for skill in self.skills]
-        
+        # OLD (indexed full markdown body -> low retrieval precision, ~50-59% wrong-object injection):
+        # tokenized_corpus = [self._tokenize(f"{skill['title']} {skill['content']}") for skill in self.skills]
+        # NEW: index only title + YAML description ("when to use") via _retrieval_doc(); see that method.
+        tokenized_corpus = [self._tokenize(self._retrieval_doc(skill)) for skill in self.skills]
+
         if not tokenized_corpus:
             return []
         
@@ -350,20 +432,27 @@ You are an expert with a sophisticated skills curator. Our overall goal is to ac
         # Get scores for the query
         doc_scores = bm25.get_scores(query_tokens)
         
-        # Create results with scores
+        # Create results with scores.
+        # NOTE: the score filter is applied ONLY when the caller explicitly sets
+        # min_score > 0. BM25Okapi IDF = log((N-n+0.5)/(n+0.5)) goes NEGATIVE when a
+        # term appears in >half the documents, so with a tiny corpus (N<=2, common in
+        # the first batch of a fresh run) even a matching query scores <= 0 and the old
+        # `score >= 0.0` gate silently returned []. RB's langchain BM25Retriever ranks
+        # and returns top-k with no score gate; we match that here so early-run
+        # retrieval is never empty. (Was: `if score >= min_score`.)
         results = []
         for i, skill in enumerate(self.skills):
             score = doc_scores[i]
-            if score >= min_score:
+            if min_score <= 0.0 or score >= min_score:
                 results.append((skill, score))
-        
+
         # Sort by score descending
         results.sort(key=lambda x: x[1], reverse=True)
-        
+
         # Apply top_k limit if specified
         if top_k is not None:
             results = results[:top_k]
-        
+
         return results
 
     def _search_embedding(self, query: str, top_k: int = None, min_score: float = 0.0) -> List[Tuple[Dict[str, str], float]]:

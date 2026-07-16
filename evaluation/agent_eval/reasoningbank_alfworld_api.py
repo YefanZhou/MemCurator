@@ -44,6 +44,26 @@ _GCLOUD_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT")  or "salesforce-resear
 _GCLOUD_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
 
 
+def _completion_with_temp_fallback(**kwargs):
+    """litellm.completion, but if the model rejects a non-1 temperature (gpt-5 / gpt-5.x reasoning
+    models: 'temperature does not support X; only the default (1) value is supported'), retry once
+    WITHOUT temperature (and top_p if it also complains). vLLM/other models never raise this, so
+    they are unaffected. Without this a gpt-5.x curator crashes and the memory store stays EMPTY."""
+    from litellm import completion
+    try:
+        return completion(**kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        retried = dict(kwargs); changed = False
+        if "temperature" in msg and ("does not support" in msg or "only the default" in msg or "unsupported value" in msg):
+            retried.pop("temperature", None); changed = True
+        if "top_p" in msg and ("does not support" in msg or "unsupported value" in msg):
+            retried.pop("top_p", None); changed = True
+        if not changed:
+            raise
+        return completion(**retried)
+
+
 SUCCESSFUL_SI = """You are an expert in household task planning. You will be given a task and a trajectory representing how an agent successfully completed the task in a household environment.
 
 ## Guidelines
@@ -142,7 +162,6 @@ class ReasoningBankAlfworld:
             )
             return resp.text or ""
         if self.curation_base_url is not None:
-            from litellm import completion
             # Was hardcoded: temperature=0.7, max_tokens=1024 (no top_p/top_k/thinking).
             # Now env-driven via CURATION_* knobs (max_tokens default kept at 1024).
             kwargs = dict(
@@ -168,7 +187,7 @@ class ReasoningBankAlfworld:
                 kwargs["extra_body"] = extra_body
             if _CUR_EXTERNAL and _X_API_KEY:
                 kwargs["extra_headers"] = {"X-Api-Key": _X_API_KEY}
-            resp = completion(**kwargs)
+            resp = _completion_with_temp_fallback(**kwargs)
             return resp.choices[0].message.content or ""
         if self.curation_tokenizer is not None:
             # Local tokenizer path: honour CURATION_ENABLE_THINKING if set, else keep

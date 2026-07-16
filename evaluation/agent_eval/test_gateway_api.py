@@ -37,6 +37,11 @@ def _extra_headers():
     return {"X-Api-Key": x} if x else None
 
 
+# gpt-5 / gpt-5.x reasoning models reject any temperature != 1 ("Only the default (1) value is
+# supported"). Default the smoke test to 1.0 (accepted by ALL gateway models); override via env.
+_TEST_TEMP = float(os.environ.get("TEST_TEMPERATURE", "1.0"))
+
+
 def test_executor(model: str) -> bool:
     """Executor path: NO top_k / chat_template_kwargs in extra_body (external gateway)."""
     from litellm import completion
@@ -45,7 +50,7 @@ def test_executor(model: str) -> bool:
         messages=[{"role": "user", "content": "Reply with exactly: OK"}],
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_API_BASE"],
-        temperature=0.7,
+        temperature=_TEST_TEMP,
         num_retries=3,
     )
     hdrs = _extra_headers()
@@ -83,7 +88,7 @@ def test_curator_tool_calls(model: str) -> bool:
         messages=messages,
         api_key=os.environ["OPENAI_API_KEY"],
         base_url=os.environ["OPENAI_API_BASE"],
-        temperature=0.7,
+        temperature=_TEST_TEMP,
         num_retries=3,
         tools=MEMORY_TOOL_SCHEMAS,
         tool_choice="auto",
@@ -117,14 +122,23 @@ def main():
     print(f"[info] x_api_key = {'set' if os.environ.get('X_API_KEY') else 'unset'}")
     print(f"[info] model    = {model}\n")
 
+    # EXECUTOR_ONLY=1 skips the (b) skillos tool-call probe — useful for memory=none preflights
+    # that never curate (avoids the confusing "skillos" block in the log).
+    executor_only = os.environ.get("EXECUTOR_ONLY", "").lower() in ("1", "true", "yes")
+
     ok_exec = False
-    ok_cur = False
+    ok_cur = True   # default True; only set by test (b) when it runs
     try:
         print("=== (a) executor call ===")
         ok_exec = test_executor(model)
     except Exception as e:
         print(f"[executor] ERROR: {type(e).__name__}: {e}")
 
+    if executor_only:
+        print(f"\n[result] executor={'PASS' if ok_exec else 'FAIL'}  (curator probe skipped: EXECUTOR_ONLY=1)")
+        sys.exit(0 if ok_exec else 1)
+
+    ok_cur = False
     try:
         print("\n=== (b) skillos native tool-calling curation ===")
         ok_cur = test_curator_tool_calls(model)
