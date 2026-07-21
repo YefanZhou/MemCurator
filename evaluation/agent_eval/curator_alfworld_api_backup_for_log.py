@@ -13,7 +13,7 @@ Design (the essential difference vs ReasoningBank):
     and return that briefing for injection. (ReasoningBank does NO LLM on read; it just
     concatenates stored items.)
 
-Preserved gotchas from the original dev logs:  dfdf
+Preserved gotchas from the original dev logs:
   * Q2 — empty store => return "" with NO LLM call (no evidence-free hallucinated briefing).
   * Q3 — the retrieval / curator key must be the natural-language task description, not a
     file path. The runner passes ``task_descriptions[i]`` so this holds by construction.
@@ -25,12 +25,8 @@ Training-awareness (mirrors how SkillOS's curator is made GRPO-trainable):
     used by the other methods, and the curation checkpoint is swappable via
     ``--curation_model`` / ``--curation_base_url`` (see ``init_memory`` in the runner).
   * ``_strip_think`` is a named parser hook where a later format/reward check can attach.
-  * Every read-time curation call is logged to a sibling ``curator_calls.jsonl`` as
-    ``{query, retrieved, retrieved_text, messages, model, briefing}``. ``messages`` is the
-    FULL system+user prompt actually sent to the curator LLM (prompt-auditable); ``retrieved``
-    is per-entry provenance ``[{store_index, score, rank, key, question, status}]`` —
-    store_index is the unambiguous row in curator_memory.jsonl (resolves the duplicate-query
-    ambiguity) and score is the real BM25 relevance, so retrieval quality is fully traceable.
+  * Every read-time curation call is logged as ``{query, retrieved_text, briefing}`` to a
+    sibling ``curator_calls.jsonl`` so the read-time policy is harvestable for training.
 
 Backend selection and the ``CURATION_*`` sampling env knobs are identical to
 ``reasoningbank_alfworld.py`` on purpose, so curation behaves the same across memory types.
@@ -41,7 +37,9 @@ import re
 import json
 import logging
 from typing import Dict, List, Optional
-from vllm import SamplingParams
+# NOTE (_api): `from vllm import SamplingParams` is NOT imported at module top here — it is
+# imported lazily inside the local-vLLM branch of _llm_from_messages(). This lets a pure-HTTP /
+# external-gateway curator import this module on a box without vllm installed.
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 
@@ -68,6 +66,35 @@ _CUR_TOP_K    = _cur_int("CURATION_TOP_K", None)
 _CUR_MAX_TOK  = _cur_int("CURATION_MAX_TOKENS", 1024)   # prior default was 1024
 _CET          = os.environ.get("CURATION_ENABLE_THINKING", "")
 _CUR_THINKING = None if _CET == "" else (_CET.lower() in ("1", "true", "yes"))
+
+# _api: external-gateway curator switch. When CURATION_LLM_BACKEND=openai the vLLM-only extra_body
+# fields (top_k, chat_template_kwargs) are NOT sent, and the X-Api-Key header is attached if set.
+_CUR_EXTERNAL = (os.environ.get("CURATION_LLM_BACKEND", "vllm").lower() == "openai")
+_X_API_KEY    = os.environ.get("X_API_KEY") or None
+# Vertex (gemini/) creds — default to the Salesforce Vertex project (matches tests/test_api_model.py)
+# if the env vars are unset, so a gemini curator works without extra exports.
+_GCLOUD_PROJECT  = os.environ.get("GOOGLE_CLOUD_PROJECT")  or "salesforce-research-internal"
+_GCLOUD_LOCATION = os.environ.get("GOOGLE_CLOUD_LOCATION") or "global"
+
+
+def _completion_with_temp_fallback(**kwargs):
+    """litellm.completion, but if the model rejects a non-1 temperature (gpt-5 / gpt-5.x reasoning
+    models: 'temperature does not support X; only the default (1) value is supported'), retry once
+    WITHOUT temperature (and top_p if it also complains). vLLM/other models never raise this, so
+    they are unaffected. Without this a gpt-5.x curator crashes and the memory store stays EMPTY."""
+    from litellm import completion
+    try:
+        return completion(**kwargs)
+    except Exception as e:
+        msg = str(e).lower()
+        retried = dict(kwargs); changed = False
+        if "temperature" in msg and ("does not support" in msg or "only the default" in msg or "unsupported value" in msg):
+            retried.pop("temperature", None); changed = True
+        if "top_p" in msg and ("does not support" in msg or "unsupported value" in msg):
+            retried.pop("top_p", None); changed = True
+        if not changed:
+            raise
+        return completion(**retried)
 
 # Whether to log every read-time curation call to curator_calls.jsonl (default on).
 _LOG_CALLS = os.environ.get("CURATOR_LOG_CALLS", "1").lower() in ("1", "true", "yes")
@@ -170,27 +197,50 @@ class CuratorAlfworld:
         (from ``build_curator_messages``) instead of ``(system, user)`` strings, so the
         tokenizer / apply_chat_template / backend selection path is shared and unchanged.
         """
+        # gemini/ curator -> Vertex AI. Curator curation is plain text-in/text-out (the read-time
+        # briefing text is used directly), so no function-calling is needed here.
+        if self.curation_model_name and self.curation_model_name.startswith("gemini/"):
+            from google import genai
+            from google.genai import types
+            model_id = self.curation_model_name[len("gemini/"):]
+            system_msg = next((m["content"] for m in messages if m["role"] == "system"), None)
+            user_text  = "\n\n".join(m["content"] for m in messages if m["role"] != "system")
+            client = genai.Client(vertexai=True, project=_GCLOUD_PROJECT, location=_GCLOUD_LOCATION)
+            resp = client.models.generate_content(
+                model=model_id,
+                contents=user_text,
+                config=types.GenerateContentConfig(
+                    temperature=_CUR_TEMP,
+                    system_instruction=system_msg,
+                    max_output_tokens=_CUR_MAX_TOK,
+                ),
+            )
+            return resp.text or ""
         if self.curation_base_url is not None:
-            from litellm import completion
             kwargs = dict(
                 model=self.curation_model_name,
                 messages=messages,
                 api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
                 base_url=self.curation_base_url,
                 temperature=_CUR_TEMP,
-                max_tokens=_CUR_MAX_TOK,
                 num_retries=10,
             )
+            # gpt-5 family rejects `max_tokens` -> use `max_completion_tokens` when external.
+            kwargs["max_completion_tokens" if _CUR_EXTERNAL else "max_tokens"] = _CUR_MAX_TOK
             if _CUR_TOP_P is not None:
                 kwargs["top_p"] = _CUR_TOP_P
+            # extra_body (top_k, chat_template_kwargs) is vLLM-only; skip for external gateway.
             extra_body = {}
-            if _CUR_TOP_K is not None:
-                extra_body["top_k"] = _CUR_TOP_K
-            if _CUR_THINKING is not None:
-                extra_body["chat_template_kwargs"] = {"enable_thinking": _CUR_THINKING}
+            if not _CUR_EXTERNAL:
+                if _CUR_TOP_K is not None:
+                    extra_body["top_k"] = _CUR_TOP_K
+                if _CUR_THINKING is not None:
+                    extra_body["chat_template_kwargs"] = {"enable_thinking": _CUR_THINKING}
             if extra_body:
                 kwargs["extra_body"] = extra_body
-            resp = completion(**kwargs)
+            if _CUR_EXTERNAL and _X_API_KEY:
+                kwargs["extra_headers"] = {"X-Api-Key": _X_API_KEY}
+            resp = _completion_with_temp_fallback(**kwargs)
             return resp.choices[0].message.content or ""
         if self.curation_tokenizer is not None:
             enable_thinking = False if _CUR_THINKING is None else _CUR_THINKING
@@ -201,6 +251,9 @@ class CuratorAlfworld:
         else:
             # No tokenizer/backend: flatten to plain text (used only in tests/stubs).
             prompt = "\n\n".join(m["content"] for m in messages)
+        # Local vLLM path — import SamplingParams lazily here (not at module top) so a pure-HTTP
+        # / external-gateway curator can import this module without vllm installed.
+        from vllm import SamplingParams
         sp_kwargs = dict(temperature=_CUR_TEMP, max_tokens=_CUR_MAX_TOK)
         if _CUR_TOP_P is not None:
             sp_kwargs["top_p"] = _CUR_TOP_P
@@ -243,19 +296,6 @@ class CuratorAlfworld:
             f"Trajectory:\n{record.get('trajectory', '')}"
         )
 
-    @staticmethod
-    def _bm25_scores(retriever, query: str):
-        """Real BM25 relevance scores over ALL docs (index-aligned to store `idx`), via the
-        rank_bm25 backend the langchain BM25Retriever wraps. Returns a list or None if the
-        backend/API differs (logging must never break retrieval)."""
-        try:
-            pre = getattr(retriever, "preprocess_func", None)
-            toks = pre(query) if pre is not None else query.split()
-            return list(retriever.vectorizer.get_scores(toks))
-        except Exception as e:
-            logger.warning(f"Could not compute BM25 scores (logging only): {e}")
-            return None
-
     def _rebuild_bm25(self):
         if not self.memory_bank:
             self.bm25_retriever = None
@@ -273,33 +313,16 @@ class CuratorAlfworld:
         with open(self.storage_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
-    def _log_call(self, query: str, retrieved_text: str, briefing: str,
-                  messages: List[Dict[str, str]] = None, retrieved: List[Dict] = None,
-                  briefing_raw: str = None):
+    def _log_call(self, query: str, retrieved_text: str, briefing: str):
         if not _LOG_CALLS:
             return
         try:
-            rec = {
-                "query": query,
-                # Per-retrieved-entry provenance: store_index (row in curator_memory.jsonl —
-                # UNAMBIGUOUS even when query strings duplicate), BM25 score, rank, key,
-                # question, status. Unblocks retrieval-quality/causal analysis.
-                "retrieved": retrieved if retrieved is not None else [],
-                "retrieved_text": retrieved_text,
-                # The FULL prompt actually sent to the curator LLM (system + user), so each
-                # run is self-documenting / prompt-auditable. Falls back to rebuilding it if
-                # not passed in.
-                "messages": messages if messages is not None else build_curator_messages(
-                    query, retrieved_text),
-                "model": self.curation_model_name,
-                # briefing = what's INJECTED (post _strip_think). briefing_raw = the RAW curator
-                # LLM output BEFORE strip — lets you verify CURATION_ENABLE_THINKING (a <think>
-                # block present in raw but not in briefing => the curator was thinking).
-                "briefing": briefing,
-                "briefing_raw": briefing_raw if briefing_raw is not None else briefing,
-            }
             with open(self.calls_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+                f.write(json.dumps({
+                    "query": query,
+                    "retrieved_text": retrieved_text,
+                    "briefing": briefing,
+                }) + "\n")
         except Exception as e:  # logging must never break a run
             logger.warning(f"Failed to log curator call: {e}")
 
@@ -353,7 +376,6 @@ class CuratorAlfworld:
         """
         curator_question = curator_question if curator_question is not None else query
         retrieved_text = ""
-        retrieved_meta: List[Dict] = []   # per-entry {store_index, score, rank, key, question, status}
         if self.bm25_retriever is not None:
             if n is not None and n != self.retrieve_num:
                 docs_all = [
@@ -368,26 +390,11 @@ class CuratorAlfworld:
                 retriever = self.bm25_retriever
 
             docs = retriever.invoke(query)   # BM25 keys on the SHORT task, always
-            # Surface the real BM25 scores for the retrieved docs. rank_bm25 (the backend)
-            # scores ALL docs for the query; index by each retrieved doc's store `idx`.
-            bm25_scores = self._bm25_scores(retriever, query)
             parts = []
             for j, doc in enumerate(docs or [], 1):
                 idx = doc.metadata["idx"]
                 record = self.memory_bank[idx]
                 parts.append(self._format_case(j, record))
-                retrieved_meta.append({
-                    "store_index": idx,                       # row in curator_memory.jsonl (unambiguous)
-                    "score": (round(float(bm25_scores[idx]), 6)
-                              if bm25_scores is not None and idx < len(bm25_scores) else None),
-                    "rank": j,                                # 1-based BM25 rank in this retrieval
-                    # `key` = the EXACT text BM25 indexed/matched on (Document.page_content).
-                    # Today this equals `question` (the NL task), but logging page_content
-                    # directly keeps the log correct if the retrieval key ever changes.
-                    "key": doc.page_content,
-                    "question": record.get("query", ""),
-                    "status": record.get("status", "success"),
-                })
             retrieved_text = "\n\n".join(parts)
 
         # Nothing retrieved: by default (Q2) do NOT call the curator LLM — return "" so no
@@ -399,8 +406,6 @@ class CuratorAlfworld:
         # curator_question (may be enriched) becomes "Question: {..}" for the CURRENT task;
         # retrieved_text still holds the short past-task Questions from _format_case.
         messages = build_curator_messages(curator_question, retrieved_text)
-        briefing_raw = self._llm_from_messages(messages)   # RAW LLM output (may contain <think>)
-        briefing = _strip_think(briefing_raw)              # what actually gets injected
-        self._log_call(curator_question, retrieved_text, briefing,
-                       messages=messages, retrieved=retrieved_meta, briefing_raw=briefing_raw)
+        briefing = _strip_think(self._llm_from_messages(messages))
+        self._log_call(curator_question, retrieved_text, briefing)
         return briefing if briefing else ""

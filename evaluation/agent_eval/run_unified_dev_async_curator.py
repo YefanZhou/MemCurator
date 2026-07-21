@@ -681,7 +681,9 @@ def retrieve_context(memory_type, memory_obj, query: str, retrieve_num: int,
         return get_skillos_text(memory_obj, query, retrieve_num)
     elif memory_type == 'reasoningbank':
         return get_reasoningbank_text(memory_obj, query, retrieve_num)
-    elif memory_type == 'curator':
+    elif memory_type in ('curator', 'curator_v1'):
+        # curator_v1 (faithful vendored-prompt curator) exposes the SAME
+        # retrieve(query, n, curator_question) -> str seam, so the same helper works.
         return get_curator_text(memory_obj, query, retrieve_num, curator_question=curator_question)
     return ""
 
@@ -900,6 +902,8 @@ def run_one_game(game_file, game_idx, model, max_steps,
 
     history = []
     raw_trace = []
+    step_responses = []   # full raw executor response per step (CoT source for curator with_thinking);
+                          # collected ALWAYS (independent of SAVE_RAW) — small (strings already in memory).
     reward = 0.0
     _probe = (game_idx == 0)
 
@@ -955,6 +959,7 @@ def run_one_game(game_file, game_idx, model, max_steps,
         # LLM call — OUTSIDE the lock (this is where episodes overlap)
         response = llm([{"role": "user", "content": prompt_text}], None, model)
 
+        step_responses.append(response)   # always kept (curator with_thinking reads the CoT here)
         if SAVE_RAW:
             raw_trace.append({"step": step_count, "prompt": prompt_text, "response": response})
 
@@ -991,7 +996,8 @@ def run_one_game(game_file, game_idx, model, max_steps,
     messages.append({"role": "user", "content": current_ob})
 
     out = {"game_idx": game_idx, "messages": messages, "reward": reward,
-           "name": name, "task_description": task_description, "ctx_text": ctx_text}
+           "name": name, "task_description": task_description, "ctx_text": ctx_text,
+           "step_responses": step_responses}   # curator with_thinking CoT source (per-step raw responses)
     if SAVE_RAW:
         out["raw_trace"] = raw_trace
     return out
@@ -1842,6 +1848,29 @@ def init_memory(args, storage_path, env_name='alfworld'):
         print(f"CuratorAlfworld ({'HTTP' if use_http else 'vLLM'}) initialised at {storage_path}")
         return curator, curation_tokenizer, curation_model_hf
 
+    elif args.memory_type == 'curator_v1':
+        # curator_v1 — faithful-prompt MemCurator (curator_alfworld_v1.py): verbatim-derived
+        # system prompts + --curation_mode {success_only, success_and_fail} + reward-aware
+        # store. Same seam/plumbing as curator; ALFWorld only.
+        from curator_alfworld_v1 import CuratorAlfworld as CuratorAlfworldV1
+        curator = CuratorAlfworldV1(
+            storage_path=storage_path,
+            curation_model_hf=curation_model_hf,
+            curation_tokenizer=curation_tokenizer,
+            retrieve_num=args.retrieve_num,
+            curation_model_name=args.curation_model,
+            curation_base_url=curation_base_url,
+            curator_on_empty=getattr(args, 'curator_on_empty', False),
+            curation_mode=getattr(args, 'curation_mode', 'success_only'),
+            trajectory_style=getattr(args, 'curator_trajectory_style', 'action_only'),
+            think_token_budget=getattr(args, 'curator_think_token_budget', 8000),
+        )
+        print(f"CuratorAlfworldV1 ({'HTTP' if use_http else 'vLLM'}, "
+              f"mode={getattr(args, 'curation_mode', 'success_only')}, "
+              f"traj={getattr(args, 'curator_trajectory_style', 'action_only')}) "
+              f"initialised at {storage_path}")
+        return curator, curation_tokenizer, curation_model_hf
+
     raise ValueError(f"Unknown memory_type: {args.memory_type}")
 
 
@@ -1899,6 +1928,23 @@ def update_memory_after_batch(
             )
         # CuratorAlfworld persists internally via its storage_path
 
+    elif memory_type == 'curator_v1':
+        for result, task_desc in zip(batch_results, task_descriptions):
+            task_id = result.get('name', task_desc[:40]).replace('/', '_')
+            # curator_v1 stores the NUMERIC reward (add() normalizes to float; success=reward>0),
+            # so pass result['reward'] directly (NOT bool-cast) to preserve graded values.
+            # In success_and_fail mode failures are stored too; in success_only they're skipped.
+            # step_responses = the raw per-step CoT (add() uses it only for with_thinking style;
+            # ignored/None-safe for action_only). run_one_game always populates it.
+            memory_obj.add(
+                task_id=task_id,
+                task=task_desc,
+                messages=result['messages'],
+                reward=result['reward'],
+                step_responses=result.get('step_responses'),
+            )
+        # CuratorAlfworldV1 persists internally via its storage_path
+
 
 # ------------------------------------------------------------------ #
 # Main                                                                #
@@ -1927,6 +1973,8 @@ def main(args):
         _mem_file = 'skills.json'
     elif memory_type == 'curator':
         _mem_file = 'curator_memory.jsonl'
+    elif memory_type == 'curator_v1':
+        _mem_file = 'curator_v1_memory.jsonl'
     else:
         _mem_file = 'reasoning_bank.jsonl'
     skills_storage_path = os.path.join(output_path, _mem_file)
@@ -1970,7 +2018,7 @@ def main(args):
         return
 
     # ---- Validate memory_type / env combination (alfworld / webshop) ----
-    if memory_type in ('reasoningbank', 'curator') and args.env != 'alfworld':
+    if memory_type in ('reasoningbank', 'curator', 'curator_v1') and args.env != 'alfworld':
         print(f"[WARNING] {memory_type} only supports ALFWorld for interactive tasks; "
               f"env='{args.env}' will run WITHOUT memory.")
         memory_type = 'none'
@@ -1983,11 +2031,13 @@ def main(args):
     # ---- Injected-memory starter (heading/preamble) + label for prompt templates ----
     # Per-method defaults keep existing prompts byte-identical; --context_header /
     # --context_label override them when provided.
-    _DEFAULT_LABELS  = {'skillos': 'Skills', 'reasoningbank': 'Memories', 'curator': 'experiences'}
+    _DEFAULT_LABELS  = {'skillos': 'Skills', 'reasoningbank': 'Memories',
+                        'curator': 'experiences', 'curator_v1': 'experiences'}
     _DEFAULT_HEADERS = {
         'skillos':       '## Past Relevant Skills',
         'reasoningbank': '## Past Relevant Memories',
         'curator':       'Here are past experiences and trajectories that might be helpful for your decision:',
+        'curator_v1':    'Here are past experiences and trajectories that might be helpful for your decision:',
     }
     context_label  = args.context_label  if getattr(args, 'context_label', None)  else _DEFAULT_LABELS.get(memory_type, 'Memories')
     context_header = args.context_header if getattr(args, 'context_header', None) else _DEFAULT_HEADERS.get(memory_type, f'## Past Relevant {context_label}')
@@ -2235,7 +2285,7 @@ if __name__ == '__main__':
                         choices=['alfworld', 'webshop', 'amc23', 'aime24', 'aime25', 'gpqa'],
                         help='Task environment')
     parser.add_argument('--memory_type',    type=str,  default='none',
-                        choices=['none', 'skillos', 'reasoningbank', 'curator'],
+                        choices=['none', 'skillos', 'reasoningbank', 'curator', 'curator_v1'],
                         help='Memory mechanism to use')
     parser.add_argument('--split',          type=str,  default='dev',
                         choices=['dev', 'test', 'train'],
@@ -2265,6 +2315,27 @@ if __name__ == '__main__':
                         help='(curator only) Call the curator LLM to produce a briefing even '
                              'when retrieval returns nothing (empty/cold store). Default OFF: '
                              'empty retrieval -> no LLM call, no briefing (the Q2 behavior).')
+    parser.add_argument('--curation_mode', type=str, default='success_only',
+                        choices=['success_only', 'success_only_v1',
+                                 'success_and_fail', 'success_and_fail_v1'],
+                        help='(curator_v1 only) success_only: store & curate only successful '
+                             'trajectories (default). success_only_v1: same success-only store, '
+                             'but a REVISED briefing prompt (CURATOR_SYSTEM_SUCCESS_ONLY_V1) for '
+                             'A/B prompt comparison. success_and_fail: also store failures and '
+                             'tag each retrieved memory Result: Success/Failure so the curator '
+                             'can warn about pitfalls. success_and_fail_v1: same store/mark as '
+                             'success_and_fail, but the REVISED prompt (CURATOR_SYSTEM_SUCCESS_AND_FAIL_V1).')
+    parser.add_argument('--curator_trajectory_style', type=str, default='action_only',
+                        choices=['action_only', 'with_thinking'],
+                        help='(curator_v1 only) How stored trajectories are rendered for the '
+                             'curator. action_only (default): [Observation]/[Action] per step '
+                             '(unchanged). with_thinking: also inject a per-step [Thinking] line '
+                             'extracted from the raw executor CoT (head/tail-truncated to fit '
+                             '--curator_think_token_budget).')
+    parser.add_argument('--curator_think_token_budget', type=int, default=8000,
+                        help='(curator_v1, with_thinking only) Total ~token budget for thinking '
+                             'per trajectory; split evenly across steps to a per-step char cap '
+                             '(head/tail truncation). <=0 = unbounded (keep full thinking).')
     parser.add_argument('--task_context', type=str, default='short',
                         choices=['short', 'obs0'],
                         help='(curator only) What the curator LLM sees as the CURRENT-task '

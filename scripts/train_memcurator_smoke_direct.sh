@@ -1,0 +1,212 @@
+# MemCurator Stage-C SMOKE — DASHBOARD-FREE variant of train_memcurator_smoke.sh.
+#
+# WHY THIS EXISTS: on box2 the Ray DASHBOARD is intermittently broken — `ray start` logs
+# "Failed to start the dashboard" / "Module EventHead failed to start. Timeout after 30s", and then
+# `ray job submit` (which talks to the dashboard's HTTP job-server on :8265) fails with 504 or
+# "ConnectionError: Could not read 'dashboard' from GCS". It's a coin-flip: the first green smoke got
+# lucky, later ones didn't. This script REMOVES the dashboard from the path entirely:
+#   * `ray start --head --include-dashboard=false`  (no dashboard subprocess at all)
+#   * run `python -m verl.trainer.main_ppo` DIRECTLY (not via `ray job submit`); main_ppo's
+#     ray.init() attaches to the running cluster via RAY_ADDRESS=auto.
+# Everything else (every hydra arg, all knobs, artifact layout) is IDENTICAL to the job-submit script.
+#
+# Because we bypass `ray job submit` (which injected runtime_env.yaml's env_vars into the driver +
+# workers), we EXPORT those env_vars here in the shell before `ray start` — the head, driver, and all
+# worker actors spawned from this cluster inherit them. So runtime_env.yaml is NOT used by this path.
+#
+# Usage (from box2, executor served on :8001, conda env active):
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 EXECUTOR_API_BASE=http://localhost:8001/v1 NGPUS=4 TEST_FREQ=1 \
+#     bash scripts/train_memcurator_smoke_direct.sh
+
+export HYDRA_FULL_ERROR=1
+export LD_LIBRARY_PATH=/fsx/home/yefan.zhou/miniconda3/envs/memory/lib:${LD_LIBRARY_PATH:-}
+
+#!/usr/bin/env bash
+set -xeuo pipefail
+
+# ---- env_vars that `ray job submit` used to inject from runtime_env.yaml. Export them HERE so the
+# ray head + driver + all worker actors inherit them (this path does not read runtime_env.yaml). ----
+export TORCH_NCCL_AVOID_RECORD_STREAMS=1
+export PYTHONPATH="/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1
+export PYTHONFAULTHANDLER=1
+export RAY_DEDUP_LOGS=0
+# textworld libdownward per-step init_env temp copies -> big /fsx disk (workers inherit this).
+export TMPDIR="/fsx/home/yefan.zhou/tmp"
+export PROMPT_STYLE="${PROMPT_STYLE:-revise_react}"
+export ALFWORLD_DATA="${ALFWORLD_DATA:-/fsx/home/yefan.zhou/.cache/alfworld}"
+export ALFWORLD_GAMEFILES_CACHE_DIR="${ALFWORLD_GAMEFILES_CACHE_DIR:-/fsx/home/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache}"
+export VLLM_ATTENTION_BACKEND=XFORMERS
+
+# ---- Artifact root: EVERYTHING under mem-evolve/results/<exp>/<stamp>/, NEVER in the repo. ----
+RESULTS_ROOT="${RESULTS_ROOT:-/fsx/home/yefan.zhou/mem-evolve/results}"
+exp_name="${EXP_NAME:-memcurator-SMOKE-qwen3-8b-alfworld}"
+RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
+RUN_DIR="${RESULTS_ROOT}/${exp_name}/${RUN_STAMP}"
+
+SMOKE_LOG_DIR="${SMOKE_LOG_DIR:-${RUN_DIR}/logs}"
+mkdir -p "$SMOKE_LOG_DIR"
+SMOKE_LOG="$SMOKE_LOG_DIR/smoke_$(date +%Y%m%d_%H%M%S).log"
+exec > >(stdbuf -oL awk '{ "date +%H:%M:%S" | getline t; close("date +%H:%M:%S"); print t" | "$0; fflush() }' | tee -a "$SMOKE_LOG") 2>&1
+echo "[smoke-direct] logging to $SMOKE_LOG"
+
+# ---- SMOKE knobs (tiny) ----
+train_batch_size="${TRAIN_BATCH_SIZE:-4}"
+val_batch_size="${VAL_BATCH_SIZE:-2}"
+customized_grpo_rollout_n="${GRPO_N:-2}"
+total_training_steps="${TOTAL_STEPS:-2}"
+ppo_mini_batch_size="${PPO_MINI:-4}"
+NGPUS="${NGPUS:-2}"
+save_freq="${SAVE_FREQ:-100000}"
+test_freq="${TEST_FREQ:-100000}"
+
+# ---- reward weights ----
+compression_ratio_weight=0.0
+function_content_reward_weight=0.0
+function_call_reward_weight=0.0
+
+# ---- MemCurator knobs ----
+DATASET_PATH="${DATASET_PATH:-/fsx/home/yefan.zhou/mem-evolve/data/datasets/smoke_dataset/dataset.jsonl}"
+EXECUTOR_MODEL="${EXECUTOR_MODEL:-openai/Qwen/Qwen3-8B}"
+EXECUTOR_API_BASE="${EXECUTOR_API_BASE:-http://localhost:8000/v1}"
+CURATOR_VARIANT="${CURATOR_VARIANT:-curator_alfworld_v1_api}"
+CURATION_MODE="${CURATION_MODE:-success_only_v1}"
+RETRIEVE_NUM="${RETRIEVE_NUM:-3}"
+HISTORY_LENGTH="${HISTORY_LENGTH:-3}"
+CURATOR_ON_EMPTY="${CURATOR_ON_EMPTY:-false}"
+EXECUTOR_TEMPERATURE="${EXECUTOR_TEMPERATURE:-1.0}"
+EXECUTOR_MAX_TOKENS="${EXECUTOR_MAX_TOKENS:-4096}"
+EXECUTOR_ENABLE_THINKING="${EXECUTOR_ENABLE_THINKING:-false}"
+EXECUTOR_TOP_P="${EXECUTOR_TOP_P:-0.95}"
+EXECUTOR_TOP_K="${EXECUTOR_TOP_K:-20}"
+
+project_name='MemCurator'
+export BASE_MODEL='Qwen/Qwen3-8B'
+export EXPERIMENT_NAME="${exp_name}"
+
+export ROLLOUT_DATA_DIR="${RUN_DIR}/rollout"
+TRAIN_DATA_DIR='/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main/data/math/'
+TEST_DATA_DIR='/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main/data/math/'
+
+# Algorithm
+adv_estimator=grpo
+use_kl_loss=true
+kl_loss_coef=0.001
+kl_loss_type=low_var_kl
+use_kl_in_reward=False
+kl_coef=0.0
+
+# Sizes / lengths
+max_prompt_length=32768
+max_response_length=8192
+max_start_length=16384
+max_obs_length=500
+enable_thinking=true
+max_turns=5
+
+WORKING_DIR="/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main"
+NNODES=1
+MODEL_PATH=${MODEL_PATH:-"${BASE_MODEL}"}
+CKPTS_DIR=${CKPTS_DIR:-"${RUN_DIR}/ckpt"}
+
+temperature=1.0
+top_p=1.0
+top_k=-1
+offload=true
+
+# ---- Ray cluster: NO dashboard (the broken component), session on local /tmp. ----
+RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_${USER:-yz}}"
+mkdir -p "$RAY_TEMP_DIR"
+
+echo "Starting Ray head (SMOKE-DIRECT, no dashboard, ${NGPUS} GPUs); ray temp-dir=${RAY_TEMP_DIR}"
+ray stop || true
+ray start --head --include-dashboard=false --num-gpus="${NGPUS}" --temp-dir="${RAY_TEMP_DIR}"
+sleep 8
+
+# main_ppo's ray.init() attaches to the running cluster (no new local cluster, no dashboard needed).
+export RAY_ADDRESS="auto"
+
+cd "${WORKING_DIR}"
+python3 -u -m verl.trainer.main_ppo \
+    data.train_files="${TRAIN_DATA_DIR}/train_grouped.parquet" \
+    data.val_files="${TEST_DATA_DIR}/test_paired.parquet" \
+    data.train_data_num=null \
+    data.val_data_num=null \
+    data.train_batch_size=${train_batch_size} \
+    data.val_batch_size=${val_batch_size} \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
+    data.max_start_length=${max_start_length} \
+    data.max_obs_length=${max_obs_length} \
+    data.shuffle_train_dataloader=True \
+    algorithm.adv_estimator=${adv_estimator} \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.enable_gradient_checkpointing=true \
+    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.actor.optim.lr=1e-6 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.05 \
+    actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    actor_rollout_ref.actor.kl_loss_type=${kl_loss_type} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=${offload} \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=${offload} \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.name=vllm \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.temperature=${temperature} \
+    actor_rollout_ref.rollout.top_p=${top_p} \
+    actor_rollout_ref.rollout.top_k="${top_k}" \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
+    trainer.logger=['console'] \
+    trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}/verl_rollout/training" \
+    trainer.val_only=false \
+    trainer.val_before_train=false \
+    trainer.validation_data_dir="${ROLLOUT_DATA_DIR}/verl_rollout/validation" \
+    trainer.default_hdfs_dir=null \
+    trainer.n_gpus_per_node=${NGPUS} \
+    trainer.nnodes=${NNODES} \
+    trainer.save_freq=${save_freq} \
+    trainer.test_freq=${test_freq} \
+    trainer.project_name="${project_name}" \
+    trainer.experiment_name="${exp_name}" \
+    trainer.total_epochs=1 \
+    trainer.default_local_dir="${CKPTS_DIR}" \
+    trainer.resume_mode=disable \
+    reward_model.compression_ratio_weight=${compression_ratio_weight} \
+    reward_model.function_content_reward_weight=${function_content_reward_weight} \
+    +reward_model.function_call_reward_weight=${function_call_reward_weight} \
+    algorithm.norm_adv_by_std_in_grpo=false \
+    enable_thinking=${enable_thinking} \
+    max_turns=${max_turns} \
+    use_memory_mode=true \
+    do_search=true \
+    customized_grpo_rollout_n=${customized_grpo_rollout_n} \
+    +curator_mode=memcurator \
+    +memcurator.dataset_path="${DATASET_PATH}" \
+    +memcurator.curator_variant="${CURATOR_VARIANT}" \
+    +memcurator.curation_mode="${CURATION_MODE}" \
+    +memcurator.retrieve_num=${RETRIEVE_NUM} \
+    +memcurator.executor_model="${EXECUTOR_MODEL}" \
+    +memcurator.executor_api_base="${EXECUTOR_API_BASE}" \
+    +memcurator.executor_temperature=${EXECUTOR_TEMPERATURE} \
+    +memcurator.executor_top_p=${EXECUTOR_TOP_P} \
+    +memcurator.executor_top_k=${EXECUTOR_TOP_K} \
+    +memcurator.executor_max_tokens=${EXECUTOR_MAX_TOKENS} \
+    +memcurator.executor_enable_thinking=${EXECUTOR_ENABLE_THINKING} \
+    +memcurator.history_length=${HISTORY_LENGTH} \
+    +memcurator.curator_on_empty=${CURATOR_ON_EMPTY} \
+    +alfworld.num_tasks=1 \
+    +alfworld.val_tasks=1 \
+    +alfworld.max_steps=30 \
+    +alfworld.same_task_type_per_chain=false \
+    +trainer.total_training_steps=${total_training_steps} \
+    env.env_name="alfworld/AlfredTWEnv" \
+    env.seed=42 \
+    env.rollout.n=${customized_grpo_rollout_n}
+
+echo "SMOKE-DIRECT done; on success you'll see ${total_training_steps} steps complete."
+ray stop || true

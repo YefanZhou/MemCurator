@@ -1,7 +1,57 @@
-working_dir: /home/siruo_google_com/SkillCurator
-excludes: [".git/", "/__pycache__/", "*.pyc", "data", "flash_attn*", "ckpt", "converted_ckpt", "evaluation"]
+working_dir: /fsx/home/yefan.zhou/mem-evolve/SkillCurator-main
+# Ray uploads working_dir to the cluster (100MB cap). Exclude everything that is NOT code needed to
+# run training, or the upload 413s. Added beyond the original SkillOS list: slurm_outputs (212M),
+# tau2-bench (165M), slurm_script, analysis, skills, *.log, and data/results/ckpt trees.
+excludes: [".git/", "**/__pycache__/", "*.pyc", "*.log", "data", "flash_attn*", "ckpt", "converted_ckpt",
+           "slurm_outputs", "slurm_script", "tau2-bench", "analysis", "skills",
+           "*.parquet", "*.jsonl", "data_preprocess", "docs",
+           # non-ALFWorld env packages we never import for alfworld (their imports are lazy, inside
+           # per-env elif branches in env_manager.py). Removes WebShop chromedriver ~11M + gym_cards
+           # card PNGs ~20M. Re-include if training those envs.
+           "agent_system/environments/env_package/webshop",
+           "agent_system/environments/env_package/gym_cards",
+           "agent_system/environments/env_package/appworld",
+           # evaluation/: we DO need evaluation/agent_eval/curator_alfworld*.py at runtime
+           # (CuratorBackend imports curator_alfworld_v1_api). So DON'T exclude all of evaluation/ —
+           # exclude only the heavy results/data + the STALE shadow copies inside it:
+           #  - Alfworld/ (eval results, ~GBs on the box)
+           #  - agent_eval/agent_system (stale shadow of the real agent_system → would shadow imports)
+           "evaluation/agent_eval/Alfworld",
+           "evaluation/agent_eval/agent_system",
+           "evaluation/agent_eval/SkillOS",
+           "evaluation/agent_eval/curator_vendor",
+           "evaluation/agent_eval/logs",
+           "evaluation/agent_eval/logs_debug",
+           "evaluation/agent_eval/vllm_logs",
+           "evaluation/agent_eval/tests",
+           "evaluation/experiments",
+           "evaluation/README.md",
+           "evaluation/requirements_backup.txt",
+           "*.csv"]
 env_vars:
   TORCH_NCCL_AVOID_RECORD_STREAMS: "1"
-  PYTHONPATH: "/home/siruo_google_com/SkillCurator"
+  PYTHONPATH: "/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main"
+  # Real-time logs: ray job submit runs the driver in a fresh env, so shell exports don't reach it —
+  # set unbuffered output HERE so the driver + all Ray worker actors stream progress live (the
+  # AlfredTWEnv 8810-game scan tqdm, MemCurator prints, etc.) instead of appearing in delayed chunks.
+  PYTHONUNBUFFERED: "1"
+  RAY_DEDUP_LOGS: "0"
+  # Route textworld's per-step init_env libdownward.so temp copies onto the big /fsx disk. MUST be
+  # in env_vars (not just the launcher shell) so the WORKER ACTORS inherit it — they're the ones that
+  # call pin_game_file→init_env every step. Prevents the sampler's [Errno 28] disk-fill on the long run.
+  TMPDIR: "/fsx/home/yefan.zhou/tmp"
+  # Executor prompt style — MUST be revise_react (matches the frac0.5 harvest; 'think' collides with
+  # the nonthink executor). memcurator.alfworld_executor reads PROMPT_STYLE at import inside the WORKER
+  # actor when building the executor prompt, so it MUST be here (shell export alone won't reach workers).
+  PROMPT_STYLE: "revise_react"
+  # ALFWorld data root — config_tw.yaml/base_config.yaml paths are '$ALFWORLD_DATA/json_2.1.1/...'.
+  # MUST be here: `ray job submit` runs the driver+workers in a FRESH env, so a shell `export
+  # ALFWORLD_DATA=...` does NOT propagate. If unset, data_path collapses to '/json_2.1.1/train' → the
+  # AlfredTWEnv scan finds 0 games (and the game_files cache would persist a 0-game file). Pinning it
+  # here makes the scan + cache robust regardless of the launching shell / node.
+  ALFWORLD_DATA: "/fsx/home/yefan.zhou/.cache/alfworld"
+  # Startup-scan game_files disk-cache location (see docs/memcurator_startup_scan_optimization.md §8).
+  # Persistent on /fsx so the ~9-min train scan is paid once, then sub-second on every later run.
+  ALFWORLD_GAMEFILES_CACHE_DIR: "/fsx/home/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache"
   # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
   # VLLM_ATTENTION_BACKEND: "XFORMERS"

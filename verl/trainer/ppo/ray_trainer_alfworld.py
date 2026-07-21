@@ -159,6 +159,52 @@ class RayPPOTrainerAlfWorld(RayPPOTrainer):
 
     def _build_generation_manager(self, is_validation=False):
         """Create the AlfWorld generation manager."""
+        # --- MemCurator (read-time briefing curator) routing: additive, gated on curator_mode.
+        # Default (unset / "skillos") falls through to the original SkillOS path UNCHANGED, so the
+        # SkillOS reproduction is byte-identical. Only curator_mode="memcurator" diverges.
+        if self.config.get("curator_mode", "skillos") == "memcurator":
+            from memcurator.generation import (
+                MemCuratorGenerationManager,
+                MemCuratorGenerationConfig,
+            )
+            mc = self.config.get("memcurator", {})
+            mc_config = MemCuratorGenerationConfig(
+                max_turns=self.config.max_turns,
+                max_start_length=self.config.data.max_start_length,
+                max_prompt_length=self.config.data.max_prompt_length,
+                max_response_length=self.config.data.max_response_length,
+                max_obs_length=self.config.data.max_obs_length,
+                num_gpus=self.config.trainer.n_gpus_per_node * self.config.trainer.nnodes,
+                respond_url=self.config.get("respond_url", None),
+                analyze_function_url=self.config.get("analyze_function_url", None),
+                enable_thinking=self.config.get("enable_thinking", True),
+                dataset_path=mc.get("dataset_path", None),
+                target_phat_lo=mc.get("target_phat_lo", None),
+                target_phat_hi=mc.get("target_phat_hi", None),
+                n_rollouts=self.config.customized_grpo_rollout_n,
+                curator_variant=mc.get("curator_variant", "curator_alfworld"),
+                curation_mode=mc.get("curation_mode", "success_only"),
+                pool_path=mc.get("pool_path", None),
+                retrieve_num=mc.get("retrieve_num", 3),
+                executor_model=mc.get("executor_model", "openai/Qwen/Qwen3-8B"),
+                executor_api_base=mc.get("executor_api_base", None),
+                executor_api_key=mc.get("executor_api_key", "EMPTY"),
+                executor_temperature=mc.get("executor_temperature", 0.7),
+                executor_top_p=mc.get("executor_top_p", None),
+                executor_top_k=mc.get("executor_top_k", None),
+                executor_max_tokens=mc.get("executor_max_tokens", None),
+                executor_enable_thinking=mc.get("executor_enable_thinking", None),
+                executor_max_steps=self.config.alfworld.get("max_steps", 30),
+                history_length=mc.get("history_length", 3),
+                curator_on_empty=mc.get("curator_on_empty", False),
+            )
+            return MemCuratorGenerationManager(
+                tokenizer=self.tokenizer,
+                actor_rollout_wg=self.actor_rollout_wg,
+                config=mc_config,
+                is_validation=is_validation,
+            )
+
         gen_config = AlfWorldGenerationConfig(
             max_turns=self.config.max_turns,
             max_start_length=self.config.data.max_start_length,

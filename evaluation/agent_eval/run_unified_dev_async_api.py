@@ -246,6 +246,32 @@ def _vertex_client():
     from google import genai
     return genai.Client(vertexai=True, project=GCLOUD_PROJECT, location=GCLOUD_LOCATION)
 
+
+# Vertex (google-genai) does NOT retry transient 5xx / 429 by default, unlike the litellm path
+# (num_retries=10). A single 503 UNAVAILABLE would otherwise crash one game (no idx_N.json) or
+# blank one curation. Retry 503/500/429/UNAVAILABLE/DEADLINE_EXCEEDED with exponential backoff.
+_VERTEX_RETRYABLE = ("503", "500", "429", "unavailable", "deadline", "resource_exhausted",
+                     "internal error", "overloaded")
+
+def _vertex_generate_content_with_retry(client, _max_tries=10, _base_delay=1.0, _max_delay=30.0, **kwargs):
+    """client.models.generate_content(**kwargs) with exponential-backoff retry on transient
+    Vertex errors. Raises the last error after _max_tries (so a truly-down call still surfaces)."""
+    last = None
+    for attempt in range(_max_tries):
+        try:
+            return client.models.generate_content(**kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            if attempt == _max_tries - 1 or not any(tok in msg for tok in _VERTEX_RETRYABLE):
+                raise
+            delay = min(_base_delay * (2 ** attempt), _max_delay)   # 1,2,4,8,16,30,30,... capped
+            print(f"[vertex retry] attempt {attempt+1}/{_max_tries} after transient error: {e} "
+                  f"-> sleeping {delay:.0f}s")
+            time.sleep(delay)
+            last = e
+    if last is not None:
+        raise last
+
 def _openai_tools_to_vertex(tool_schemas):
     """Convert OpenAI tool schemas (MEMORY_TOOL_SCHEMAS) to a Vertex types.Tool.
     JSON-schema types are upper-cased (STRING/OBJECT/...) as the Vertex SDK expects."""
@@ -654,7 +680,8 @@ def llm_vertexai(prompt, model="gemini-2.5-pro"):
     else:
         raise ValueError(f'prompt must be a list or a string, got {type(prompt)}')
     client = _vertex_client()   # project/location from env or Salesforce defaults
-    response = client.models.generate_content(
+    response = _vertex_generate_content_with_retry(
+        client,
         model=model,
         contents=text,
         config=types.GenerateContentConfig(temperature=EXECUTOR_TEMPERATURE),
@@ -1740,7 +1767,8 @@ def curation_vertex_native(messages: list, curation_model: str):
     )
     if CURATION_MAX_TOKENS is not None:            # bound the curator output (Vertex: max_output_tokens)
         _cfg["max_output_tokens"] = CURATION_MAX_TOKENS
-    response = client.models.generate_content(
+    response = _vertex_generate_content_with_retry(
+        client,
         model=model_id,
         contents=user_text,
         config=types.GenerateContentConfig(**_cfg),
@@ -1802,7 +1830,8 @@ def curation_llm(messages: list, curation_model: str, curation_base_url: str) ->
             project=os.environ["GOOGLE_CLOUD_PROJECT"],
             location=os.environ["GOOGLE_CLOUD_LOCATION"],
         )
-        response = client.models.generate_content(
+        response = _vertex_generate_content_with_retry(
+            client,
             model=model_id,
             contents=user_text,
             config=types.GenerateContentConfig(

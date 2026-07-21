@@ -249,6 +249,14 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def set_slot_task_types(self, task_types_per_slot: list):
         self.envs.set_task_types_per_slot(task_types_per_slot)
 
+    def set_slot_game_files(self, game_files_per_slot: list):
+        """[MemCurator] Pin each slot to an exact game_file (dataset-driven training).
+
+        Additive passthrough (mirrors set_slot_task_types). After this, reset() serves each
+        slot its assigned target game. Unused by the default random-sampling path.
+        """
+        self.envs.set_game_files_per_slot(game_files_per_slot)
+
     def lock_slot_task_types(self):
         """One-time setup: reset once to discover task types, then constrain each worker."""
         self.reset({})

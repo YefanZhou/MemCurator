@@ -13,7 +13,7 @@ Design (the essential difference vs ReasoningBank):
     and return that briefing for injection. (ReasoningBank does NO LLM on read; it just
     concatenates stored items.)
 
-Preserved gotchas from the original dev logs:  dfdf
+Preserved gotchas from the original dev logs:
   * Q2 — empty store => return "" with NO LLM call (no evidence-free hallucinated briefing).
   * Q3 — the retrieval / curator key must be the natural-language task description, not a
     file path. The runner passes ``task_descriptions[i]`` so this holds by construction.
@@ -25,12 +25,8 @@ Training-awareness (mirrors how SkillOS's curator is made GRPO-trainable):
     used by the other methods, and the curation checkpoint is swappable via
     ``--curation_model`` / ``--curation_base_url`` (see ``init_memory`` in the runner).
   * ``_strip_think`` is a named parser hook where a later format/reward check can attach.
-  * Every read-time curation call is logged to a sibling ``curator_calls.jsonl`` as
-    ``{query, retrieved, retrieved_text, messages, model, briefing}``. ``messages`` is the
-    FULL system+user prompt actually sent to the curator LLM (prompt-auditable); ``retrieved``
-    is per-entry provenance ``[{store_index, score, rank, key, question, status}]`` —
-    store_index is the unambiguous row in curator_memory.jsonl (resolves the duplicate-query
-    ambiguity) and score is the real BM25 relevance, so retrieval quality is fully traceable.
+  * Every read-time curation call is logged as ``{query, retrieved_text, briefing}`` to a
+    sibling ``curator_calls.jsonl`` so the read-time policy is harvestable for training.
 
 Backend selection and the ``CURATION_*`` sampling env knobs are identical to
 ``reasoningbank_alfworld.py`` on purpose, so curation behaves the same across memory types.
@@ -243,19 +239,6 @@ class CuratorAlfworld:
             f"Trajectory:\n{record.get('trajectory', '')}"
         )
 
-    @staticmethod
-    def _bm25_scores(retriever, query: str):
-        """Real BM25 relevance scores over ALL docs (index-aligned to store `idx`), via the
-        rank_bm25 backend the langchain BM25Retriever wraps. Returns a list or None if the
-        backend/API differs (logging must never break retrieval)."""
-        try:
-            pre = getattr(retriever, "preprocess_func", None)
-            toks = pre(query) if pre is not None else query.split()
-            return list(retriever.vectorizer.get_scores(toks))
-        except Exception as e:
-            logger.warning(f"Could not compute BM25 scores (logging only): {e}")
-            return None
-
     def _rebuild_bm25(self):
         if not self.memory_bank:
             self.bm25_retriever = None
@@ -273,33 +256,16 @@ class CuratorAlfworld:
         with open(self.storage_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
 
-    def _log_call(self, query: str, retrieved_text: str, briefing: str,
-                  messages: List[Dict[str, str]] = None, retrieved: List[Dict] = None,
-                  briefing_raw: str = None):
+    def _log_call(self, query: str, retrieved_text: str, briefing: str):
         if not _LOG_CALLS:
             return
         try:
-            rec = {
-                "query": query,
-                # Per-retrieved-entry provenance: store_index (row in curator_memory.jsonl —
-                # UNAMBIGUOUS even when query strings duplicate), BM25 score, rank, key,
-                # question, status. Unblocks retrieval-quality/causal analysis.
-                "retrieved": retrieved if retrieved is not None else [],
-                "retrieved_text": retrieved_text,
-                # The FULL prompt actually sent to the curator LLM (system + user), so each
-                # run is self-documenting / prompt-auditable. Falls back to rebuilding it if
-                # not passed in.
-                "messages": messages if messages is not None else build_curator_messages(
-                    query, retrieved_text),
-                "model": self.curation_model_name,
-                # briefing = what's INJECTED (post _strip_think). briefing_raw = the RAW curator
-                # LLM output BEFORE strip — lets you verify CURATION_ENABLE_THINKING (a <think>
-                # block present in raw but not in briefing => the curator was thinking).
-                "briefing": briefing,
-                "briefing_raw": briefing_raw if briefing_raw is not None else briefing,
-            }
             with open(self.calls_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec) + "\n")
+                f.write(json.dumps({
+                    "query": query,
+                    "retrieved_text": retrieved_text,
+                    "briefing": briefing,
+                }) + "\n")
         except Exception as e:  # logging must never break a run
             logger.warning(f"Failed to log curator call: {e}")
 
@@ -353,7 +319,6 @@ class CuratorAlfworld:
         """
         curator_question = curator_question if curator_question is not None else query
         retrieved_text = ""
-        retrieved_meta: List[Dict] = []   # per-entry {store_index, score, rank, key, question, status}
         if self.bm25_retriever is not None:
             if n is not None and n != self.retrieve_num:
                 docs_all = [
@@ -368,26 +333,11 @@ class CuratorAlfworld:
                 retriever = self.bm25_retriever
 
             docs = retriever.invoke(query)   # BM25 keys on the SHORT task, always
-            # Surface the real BM25 scores for the retrieved docs. rank_bm25 (the backend)
-            # scores ALL docs for the query; index by each retrieved doc's store `idx`.
-            bm25_scores = self._bm25_scores(retriever, query)
             parts = []
             for j, doc in enumerate(docs or [], 1):
                 idx = doc.metadata["idx"]
                 record = self.memory_bank[idx]
                 parts.append(self._format_case(j, record))
-                retrieved_meta.append({
-                    "store_index": idx,                       # row in curator_memory.jsonl (unambiguous)
-                    "score": (round(float(bm25_scores[idx]), 6)
-                              if bm25_scores is not None and idx < len(bm25_scores) else None),
-                    "rank": j,                                # 1-based BM25 rank in this retrieval
-                    # `key` = the EXACT text BM25 indexed/matched on (Document.page_content).
-                    # Today this equals `question` (the NL task), but logging page_content
-                    # directly keeps the log correct if the retrieval key ever changes.
-                    "key": doc.page_content,
-                    "question": record.get("query", ""),
-                    "status": record.get("status", "success"),
-                })
             retrieved_text = "\n\n".join(parts)
 
         # Nothing retrieved: by default (Q2) do NOT call the curator LLM — return "" so no
@@ -399,8 +349,6 @@ class CuratorAlfworld:
         # curator_question (may be enriched) becomes "Question: {..}" for the CURRENT task;
         # retrieved_text still holds the short past-task Questions from _format_case.
         messages = build_curator_messages(curator_question, retrieved_text)
-        briefing_raw = self._llm_from_messages(messages)   # RAW LLM output (may contain <think>)
-        briefing = _strip_think(briefing_raw)              # what actually gets injected
-        self._log_call(curator_question, retrieved_text, briefing,
-                       messages=messages, retrieved=retrieved_meta, briefing_raw=briefing_raw)
+        briefing = _strip_think(self._llm_from_messages(messages))
+        self._log_call(curator_question, retrieved_text, briefing)
         return briefing if briefing else ""
