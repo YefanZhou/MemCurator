@@ -17,12 +17,33 @@
 # ---- 1. conda env (sfr-memory on the sfr Miniconda) — PATH-prepend, no `conda activate` needed ----
 export SFR_CONDA_ENV="/fsx/sfr/yefan.zhou/miniconda3/envs/sfr-memory"
 export PATH="${SFR_CONDA_ENV}/bin:${PATH}"
-# libstdc++ etc. from the env (mirrors the launchers' LD_LIBRARY_PATH line, now env-relative).
-export LD_LIBRARY_PATH="${SFR_CONDA_ENV}/lib:${LD_LIBRARY_PATH:-}"
+# NOTE: we deliberately do NOT put ${SFR_CONDA_ENV}/lib on LD_LIBRARY_PATH. The env's python/vllm/etc.
+# already resolve their own shared libs via rpath (that's why plain `conda activate` works with a clean
+# LD_LIBRARY_PATH). Adding the env lib/ shadowed the SYSTEM libtinfo.so.6, spamming
+# "libtinfo.so.6: no version information available (required by /bin/bash|screen)" on every command —
+# harmless but noisy. Leaving LD_LIBRARY_PATH untouched removes the noise with no downside.
 
 # ---- 2. HuggingFace model cache (Qwen3 4B/4B-Instruct/8B/32B downloaded here) ----
 # vllm + verl resolve models BY NAME (e.g. Qwen/Qwen3-8B) from $HF_HOME/hub — no path args needed.
 export HF_HOME="/fsx/sfr/yefan.zhou/cache/huggingface"
+# HF auth: PASSTHROUGH from your shell (never hardcode the literal token in this committed file).
+# vllm/verl resolve models by repo-id (e.g. Qwen/Qwen3-8B), which makes huggingface_hub hit the HF
+# API to list the repo file tree even when weights are cached — an ANONYMOUS shared-box IP gets
+# 429-rate-limited (noisy; the run still recovers from the local cache). An authenticated token
+# raises the limit and quiets it. To use: `export HF_TOKEN=hf_...` in your shell BEFORE sourcing
+# this / launching; it is inherited by the ray head+driver+workers (direct path) and by
+# `ray job submit` (which snapshots the submitting shell's env). Empty = anonymous (may 429).
+export HF_TOKEN="${HF_TOKEN:-}"
+# huggingface_hub also reads HUGGING_FACE_HUB_TOKEN; mirror it so either name works.
+export HUGGING_FACE_HUB_TOKEN="${HF_TOKEN:-${HUGGING_FACE_HUB_TOKEN:-}}"
+if [ -z "${HF_TOKEN:-}" ]; then echo "[sfr_env] WARN: HF_TOKEN unset — HF calls are anonymous and may hit 429 rate-limits. export HF_TOKEN=hf_... to authenticate."; fi
+
+# W&B auth + entity: PASSTHROUGH (never hardcode the token in this committed file). To log online:
+# `export WANDB_API_KEY=wandb_...` in your shell BEFORE sourcing / launching; it is inherited by the
+# ray head+driver+workers. WANDB_ENTITY is the team/user the MemCurator project lives under.
+export WANDB_API_KEY="${WANDB_API_KEY:-}"
+export WANDB_ENTITY="${WANDB_ENTITY:-yefan_zhou}"
+if [ -z "${WANDB_API_KEY:-}" ]; then echo "[sfr_env] WARN: WANDB_API_KEY unset — online wandb logging will fail. export WANDB_API_KEY=wandb_... (or run WANDB=0 / WANDB_MODE=offline)."; fi
 
 # ---- 3. ALFWorld game data (json_2.1.1/{train,valid_seen,valid_unseen}) ----
 # config_tw.yaml / base_config.yaml paths are '$ALFWORLD_DATA/json_2.1.1/...'.

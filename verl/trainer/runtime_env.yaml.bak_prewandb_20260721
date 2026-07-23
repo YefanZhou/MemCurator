@@ -53,19 +53,5 @@ env_vars:
   # Startup-scan game_files disk-cache location (see docs/memcurator_startup_scan_optimization.md §8).
   # Persistent on /fsx so the ~9-min train scan is paid once, then sub-second on every later run.
   ALFWORLD_GAMEFILES_CACHE_DIR: "/fsx/sfr/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache"
-  # W&B logging (Task 5). MUST be in env_vars: `ray job submit` runs the driver (which calls
-  # wandb.init) in a FRESH env, so a launcher shell `export WANDB_*` does NOT reach it. project +
-  # run name come from trainer.project_name/experiment_name (hydra CLI, which DO propagate), so
-  # only the auth/mode/dir need to live here.
-  #  - OFFLINE by default: these boxes are network-restricted (HF 429s), so online sync can stall.
-  #    Runs are written locally; sync later with `wandb sync <WANDB_DIR>/wandb/offline-run-*`.
-  #    Flip to "online" once connectivity is confirmed.
-  #  - WANDB_DIR on /fsx/sfr (fast disk), NOT /fsx/home (buggy FS) and NOT the working_dir
-  #    (which Ray uploads with a 100MB cap — a wandb/ dir there would bloat the upload).
-  #  - No API key inlined here. Offline mode needs none at run time; `wandb sync` later reads the
-  #    box's cached ~/.netrc auth. For online mode, `export WANDB_API_KEY=...` before launch AND
-  #    add it to env_vars (shell export alone won't reach the ray driver).
-  WANDB_MODE: "offline"
-  WANDB_DIR: "/fsx/sfr/yefan.zhou/mem-evolve/wandb"
   # If you are using vllm<=0.6.3, you might need to set the following environment variable to avoid bugs:
   # VLLM_ATTENTION_BACKEND: "XFORMERS"

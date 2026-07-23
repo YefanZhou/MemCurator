@@ -1,46 +1,42 @@
-# MemCurator Stage-C SMOKE — DASHBOARD-FREE variant of train_memcurator_smoke.sh.
+# MemCurator Stage-C SMOKE + EVOLVING VALIDATION (#5) — extends train_memcurator_smoke_direct.sh.
 #
-# WHY THIS EXISTS: on box2 the Ray DASHBOARD is intermittently broken — `ray start` logs
-# "Failed to start the dashboard" / "Module EventHead failed to start. Timeout after 30s", and then
-# `ray job submit` (which talks to the dashboard's HTTP job-server on :8265) fails with 504 or
-# "ConnectionError: Could not read 'dashboard' from GCS". It's a coin-flip: the first green smoke got
-# lucky, later ones didn't. This script REMOVES the dashboard from the path entirely:
-#   * `ray start --head --include-dashboard=false`  (no dashboard subprocess at all)
-#   * run `python -m verl.trainer.main_ppo` DIRECTLY (not via `ray job submit`); main_ppo's
-#     ray.init() attaches to the running cluster via RAY_ADDRESS=auto.
-# Everything else (every hydra arg, all knobs, artifact layout) is IDENTICAL to the job-submit script.
+# Same dashboard-free SFR training smoke, PLUS the faithful evolving held-out validation
+# (_run_eval_loop_alfworld): a val manifest of held-out valid_seen games in the eval runner's exact
+# order, run with online-growing per-lane memory (cold -> retrieve -> brief -> execute -> writeback).
 #
-# Because we bypass `ray job submit` (which injected runtime_env.yaml's env_vars into the driver +
-# workers), we EXPORT those env_vars here in the shell before `ray start` — the head, driver, and all
-# worker actors spawned from this cluster inherit them. So runtime_env.yaml is NOT used by this path.
+# The 5 val additions over the base smoke:
+#   1. +memcurator.val_manifest_path=<smoke manifest>  -> dispatches to the evolving-val loop
+#   2. +memcurator.val_n_lanes=2                        -> 2 independent-store lanes (avg for variance)
+#   3. data.val_batch_size = n_lanes * group_size       -> the wide batch the val env_manager needs
+#   4. rollout.val_kwargs.{temperature,top_p,top_k}=0.6/0.95/20 -> curator SAMPLES (not greedy;
+#      Qwen3 thinking degrades under greedy) at the test-time operating point. The SPMD rollout reads
+#      the val temp from val_kwargs (config), so it MUST be set here.
+#   5. TEST_FREQ=1                                      -> run validation each step to exercise it
 #
-# Usage (from box2, executor served on :8001, conda env active):
-#   CUDA_VISIBLE_DEVICES=4,5,6,7 EXECUTOR_API_BASE=http://localhost:8001/v1 NGPUS=4 TEST_FREQ=1 \
-#     bash scripts/train_memcurator_smoke_direct.sh dfdfd
-
-export HYDRA_FULL_ERROR=1
-export LD_LIBRARY_PATH=/fsx/home/yefan.zhou/miniconda3/envs/memory/lib:${LD_LIBRARY_PATH:-}
+# Uses the TINY smoke manifest (val_manifest_smoke.jsonl: 2 seeds x 2 batches x 5 games) so a
+# validation is ~2-3 min, not ~20. Swap VAL_MANIFEST_PATH + VAL_BATCH_SIZE for the full run.
+#
+# Usage (box1/box2, executor served on :8001, sfr env active via .bashrc):
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 EXECUTOR_API_BASE=http://localhost:8001/v1 NGPUS=4 \
+#     bash scripts_sfr/train_memcurator_smoke_direct_val_add.sh
 
 #!/usr/bin/env bash
 set -xeuo pipefail
 
-# ---- env_vars that `ray job submit` used to inject from runtime_env.yaml. Export them HERE so the
-# ray head + driver + all worker actors inherit them (this path does not read runtime_env.yaml). ----
+source "$(dirname "$0")/../scripts/sfr_env.sh"
+
+export HYDRA_FULL_ERROR=1
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-export PYTHONPATH="/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main:${PYTHONPATH:-}"
+export PYTHONPATH="/fsx/sfr/yefan.zhou/mem-evolve/SkillCurator-main:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export RAY_DEDUP_LOGS=0
-# textworld libdownward per-step init_env temp copies -> big /fsx disk (workers inherit this).
-export TMPDIR="/fsx/home/yefan.zhou/tmp"
 export PROMPT_STYLE="${PROMPT_STYLE:-revise_react}"
-export ALFWORLD_DATA="${ALFWORLD_DATA:-/fsx/home/yefan.zhou/.cache/alfworld}"
-export ALFWORLD_GAMEFILES_CACHE_DIR="${ALFWORLD_GAMEFILES_CACHE_DIR:-/fsx/home/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache}"
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
-# ---- Artifact root: EVERYTHING under mem-evolve/results/<exp>/<stamp>/, NEVER in the repo. ----
+# ---- Artifact root ----
 RESULTS_ROOT="${RESULTS_ROOT:-/fsx/home/yefan.zhou/mem-evolve/results}"
-exp_name="${EXP_NAME:-memcurator-SMOKE-qwen3-8b-alfworld}"
+exp_name="${EXP_NAME:-memcurator-SMOKE-valadd-qwen3-8b-alfworld}"
 RUN_STAMP="${RUN_STAMP:-$(date +%Y%m%d_%H%M%S)}"
 RUN_DIR="${RESULTS_ROOT}/${exp_name}/${RUN_STAMP}"
 
@@ -48,17 +44,16 @@ SMOKE_LOG_DIR="${SMOKE_LOG_DIR:-${RUN_DIR}/logs}"
 mkdir -p "$SMOKE_LOG_DIR"
 SMOKE_LOG="$SMOKE_LOG_DIR/smoke_$(date +%Y%m%d_%H%M%S).log"
 exec > >(stdbuf -oL awk '{ "date +%H:%M:%S" | getline t; close("date +%H:%M:%S"); print t" | "$0; fflush() }' | tee -a "$SMOKE_LOG") 2>&1
-echo "[smoke-direct] logging to $SMOKE_LOG"
+echo "[smoke-valadd] logging to $SMOKE_LOG"
 
-# ---- SMOKE knobs (tiny) ----
+# ---- SMOKE knobs ----
 train_batch_size="${TRAIN_BATCH_SIZE:-4}"
-val_batch_size="${VAL_BATCH_SIZE:-2}"
 customized_grpo_rollout_n="${GRPO_N:-2}"
 total_training_steps="${TOTAL_STEPS:-2}"
 ppo_mini_batch_size="${PPO_MINI:-4}"
 NGPUS="${NGPUS:-2}"
 save_freq="${SAVE_FREQ:-100000}"
-test_freq="${TEST_FREQ:-100000}"
+test_freq="${TEST_FREQ:-1}"                         # ADD #5: run val EACH step to exercise it
 
 # ---- reward weights ----
 compression_ratio_weight=0.0
@@ -66,7 +61,7 @@ function_content_reward_weight=0.0
 function_call_reward_weight=0.0
 
 # ---- MemCurator knobs ----
-DATASET_PATH="${DATASET_PATH:-/fsx/home/yefan.zhou/mem-evolve/data/datasets/smoke_dataset/dataset.jsonl}"
+DATASET_PATH="${DATASET_PATH:-/fsx/sfr/yefan.zhou/mem-evolve/data/datasets/smoke_dataset/dataset.jsonl}"
 EXECUTOR_MODEL="${EXECUTOR_MODEL:-openai/Qwen/Qwen3-8B}"
 EXECUTOR_API_BASE="${EXECUTOR_API_BASE:-http://localhost:8000/v1}"
 CURATOR_VARIANT="${CURATOR_VARIANT:-curator_alfworld_v1_api}"
@@ -79,6 +74,31 @@ EXECUTOR_MAX_TOKENS="${EXECUTOR_MAX_TOKENS:-4096}"
 EXECUTOR_ENABLE_THINKING="${EXECUTOR_ENABLE_THINKING:-false}"
 EXECUTOR_TOP_P="${EXECUTOR_TOP_P:-0.95}"
 EXECUTOR_TOP_K="${EXECUTOR_TOP_K:-20}"
+
+# ---- EVOLVING-VAL knobs (#5) ----
+VAL_MANIFEST_PATH="${VAL_MANIFEST_PATH:-/fsx/sfr/yefan.zhou/mem-evolve/data/val_manifest_smoke.jsonl}"
+VAL_N_LANES="${VAL_N_LANES:-2}"                     # ADD #2: 2 independent-store lanes
+VAL_GROUP_SIZE="${VAL_GROUP_SIZE:-5}"               # must match the manifest's group_size (smoke=5)
+# ADD #3: val_batch_size = n_lanes * group_size (the wide batch); env_manager sizes its val workers to this.
+val_batch_size="${VAL_BATCH_SIZE:-$((VAL_N_LANES * VAL_GROUP_SIZE))}"
+# ADD #4: curator sampling at val = eval operating point (thinking-safe; NOT greedy).
+VAL_CURATOR_TEMPERATURE="${VAL_CURATOR_TEMPERATURE:-0.6}"
+VAL_CURATOR_TOP_P="${VAL_CURATOR_TOP_P:-0.95}"
+VAL_CURATOR_TOP_K="${VAL_CURATOR_TOP_K:-20}"
+VAL_WRITEBACK_SUCCESS_ONLY="${VAL_WRITEBACK_SUCCESS_ONLY:-true}"
+# val executor: THIS RUN uses the SAME executor as train (served Qwen3-8B). Leave the VAL_EXECUTOR_*
+# vars unset -> the val_executor_* hydra args are OMITTED entirely below -> config defaults (None) ->
+# _call_executor_batch falls back to the training executor. To point val at an API model instead,
+# set VAL_EXECUTOR_MODEL / VAL_EXECUTOR_API_BASE / VAL_EXECUTOR_API_KEY and the args get added.
+VAL_EXECUTOR_MODEL="${VAL_EXECUTOR_MODEL:-}"
+VAL_EXECUTOR_API_BASE="${VAL_EXECUTOR_API_BASE:-}"
+VAL_EXECUTOR_API_KEY="${VAL_EXECUTOR_API_KEY:-}"
+# build the optional val-executor hydra args ONLY if a val executor override was requested (avoids
+# passing empty-string overrides that hydra could misparse).
+VAL_EXEC_ARGS=()
+[ -n "$VAL_EXECUTOR_MODEL" ]    && VAL_EXEC_ARGS+=("+memcurator.val_executor_model=${VAL_EXECUTOR_MODEL}")
+[ -n "$VAL_EXECUTOR_API_BASE" ] && VAL_EXEC_ARGS+=("+memcurator.val_executor_api_base=${VAL_EXECUTOR_API_BASE}")
+[ -n "$VAL_EXECUTOR_API_KEY" ]  && VAL_EXEC_ARGS+=("+memcurator.val_executor_api_key=${VAL_EXECUTOR_API_KEY}")
 
 project_name='MemCurator'
 export BASE_MODEL='Qwen/Qwen3-8B'
@@ -104,26 +124,27 @@ max_obs_length=500
 enable_thinking=true
 max_turns=5
 
-WORKING_DIR="/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main"
+WORKING_DIR="/fsx/sfr/yefan.zhou/mem-evolve/SkillCurator-main"
 NNODES=1
 MODEL_PATH=${MODEL_PATH:-"${BASE_MODEL}"}
 CKPTS_DIR=${CKPTS_DIR:-"${RUN_DIR}/ckpt"}
 
-temperature=1.0
+temperature=1.0                                     # TRAIN curator temp (exploration)
 top_p=1.0
 top_k=-1
 offload=true
 
-# ---- Ray cluster: NO dashboard (the broken component), session on local /tmp. ----
+# ---- Ray cluster: NO dashboard, session on local /tmp. ----
 RAY_TEMP_DIR="${RAY_TEMP_DIR:-/tmp/ray_${USER:-yz}}"
 mkdir -p "$RAY_TEMP_DIR"
 
-echo "Starting Ray head (SMOKE-DIRECT, no dashboard, ${NGPUS} GPUs); ray temp-dir=${RAY_TEMP_DIR}"
+echo "Starting Ray head (SMOKE-VALADD, no dashboard, ${NGPUS} GPUs); ray temp-dir=${RAY_TEMP_DIR}"
+echo "[smoke-valadd] evolving val: manifest=${VAL_MANIFEST_PATH} n_lanes=${VAL_N_LANES} "\
+"val_batch_size=${val_batch_size} (=${VAL_N_LANES}x${VAL_GROUP_SIZE}) curator_temp=${VAL_CURATOR_TEMPERATURE}"
 ray stop || true
 ray start --head --include-dashboard=false --num-gpus="${NGPUS}" --temp-dir="${RAY_TEMP_DIR}"
 sleep 8
 
-# main_ppo's ray.init() attaches to the running cluster (no new local cluster, no dashboard needed).
 export RAY_ADDRESS="auto"
 
 cd "${WORKING_DIR}"
@@ -159,6 +180,10 @@ python3 -u -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=${temperature} \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k="${top_k}" \
+    actor_rollout_ref.rollout.val_kwargs.temperature=${VAL_CURATOR_TEMPERATURE} \
+    actor_rollout_ref.rollout.val_kwargs.top_p=${VAL_CURATOR_TOP_P} \
+    actor_rollout_ref.rollout.val_kwargs.top_k=${VAL_CURATOR_TOP_K} \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=true \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=${offload} \
     trainer.logger=['console'] \
@@ -199,6 +224,13 @@ python3 -u -m verl.trainer.main_ppo \
     +memcurator.executor_enable_thinking=${EXECUTOR_ENABLE_THINKING} \
     +memcurator.history_length=${HISTORY_LENGTH} \
     +memcurator.curator_on_empty=${CURATOR_ON_EMPTY} \
+    +memcurator.val_manifest_path="${VAL_MANIFEST_PATH}" \
+    +memcurator.val_n_lanes=${VAL_N_LANES} \
+    +memcurator.val_curator_temperature=${VAL_CURATOR_TEMPERATURE} \
+    +memcurator.val_curator_top_p=${VAL_CURATOR_TOP_P} \
+    +memcurator.val_curator_top_k=${VAL_CURATOR_TOP_K} \
+    +memcurator.val_writeback_success_only=${VAL_WRITEBACK_SUCCESS_ONLY} \
+    ${VAL_EXEC_ARGS[@]+"${VAL_EXEC_ARGS[@]}"} \
     +alfworld.num_tasks=1 \
     +alfworld.val_tasks=1 \
     +alfworld.max_steps=30 \
@@ -208,5 +240,5 @@ python3 -u -m verl.trainer.main_ppo \
     env.seed=42 \
     env.rollout.n=${customized_grpo_rollout_n}
 
-echo "SMOKE-DIRECT done; on success you'll see ${total_training_steps} steps complete."
+echo "SMOKE-VALADD done; on success you'll see ${total_training_steps} steps + evolving val per step."
 ray stop || true

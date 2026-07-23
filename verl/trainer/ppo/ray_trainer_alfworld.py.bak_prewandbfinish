@@ -194,7 +194,6 @@ class RayPPOTrainerAlfWorld(RayPPOTrainer):
                 executor_top_k=mc.get("executor_top_k", None),
                 executor_max_tokens=mc.get("executor_max_tokens", None),
                 executor_enable_thinking=mc.get("executor_enable_thinking", None),
-                executor_concurrency=mc.get("executor_concurrency", 0),
                 executor_max_steps=self.config.alfworld.get("max_steps", 30),
                 history_length=mc.get("history_length", 3),
                 curator_on_empty=mc.get("curator_on_empty", False),

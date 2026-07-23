@@ -1,0 +1,230 @@
+"""Build a FAITHFUL validation manifest that reproduces the eval runner's realized task order.
+
+WHY (see docs/memcurator_training_plan.md "Validation design"): the in-trainer evolving validation
+(#5) must present held-out games in the EXACT order the eval runner
+(`run_unified_dev_async_curator.py --memory_type curator_v1 --split dev`) serves them — because with
+online-evolving memory, batch k's retrieval depends on batches 0..k-1's writes, so a different order
+= a different number. The order is NOT the sorted game_files order; it is TextWorld's deterministic
+served order under `base_config.yaml` (`general.random_seed: 42`, `train_eval=eval_in_distribution`,
+`init_env(batch_size=10)`). We capture that realized order once, offline, and pin it.
+
+TWO ways to obtain the order + a cross-check:
+  (A) GENERATE  — reuse the eval runner's EXACT env construction, loop env.reset() N times, record
+      info['extra.gamefile'] per served slot. No LLM, no GPU. (default)
+  (B) --from_results DIR — harvest the realized order from a COMPLETED curator_v1 run: sort its
+      idx_<N>.json by N, read the "name" field ('/'.join(gamefile.split('/')[-3:-1])). Ground truth.
+  --verify_against DIR   — assert (A)'s captured order == (B)'s harvested name sequence (game-name
+      level). Equality proves the manifest is byte-faithful to how eval actually served the games.
+
+SUBSAMPLE (cut eval wall-clock ~40min -> ~20min while preserving order + evolution depth): within
+each realized block of `--group_size` games, keep `--keep_per_block` (drop the rest uniformly by a
+seed), then RE-BLOCK the survivors into fresh groups of `--group_size` (re-blocking halves the batch
+COUNT, which is what saves wall-clock; the memory still evolves one rung per surviving block). Emit
+`--n_seeds` independent subsamples (different within-block drops) for variance reduction; the #5
+val loop runs them as concurrent lanes.
+
+OUTPUT: <out> (jsonl). Row 0 = meta {split, group_size, total_games, seeds, keep_per_block,
+raw_order}. Rows 1.. = per-seed manifests: {seed, batches: [[game_file,...] per re-blocked batch]}.
+Game_file paths are ABSOLUTE (from the env, resolves via $ALFWORLD_DATA) so #5 can pin them directly.
+
+USAGE (CPU-only; run in sfr-memory with ALFWORLD_DATA set):
+  # generate + verify against a completed curator_v1 run, subsample to 7x10 x2 seeds:
+  python -m memcurator.build_val_manifest \
+      --split dev --group_size 10 --keep_per_block 5 --n_seeds 2 \
+      --verify_against /fsx/.../Alfworld/results/openai/gpt-5.4/dev_api-cur_v1_..._success_only_v1_..._curator_v1 \
+      --out /fsx/sfr/yefan.zhou/mem-evolve/data/val_manifest_dev.jsonl
+  # harvest-only (no env build), straight from a completed run:
+  python -m memcurator.build_val_manifest --from_results <DIR> --out <path>
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import random
+from typing import Dict, List, Optional
+
+
+# ------------------------------------------------------------------ #
+# name helper — MUST match the eval runner exactly                    #
+#   run_unified_dev_async_curator.py:901,2086:                        #
+#   name = '/'.join(gamefile.split('/')[-3:-1])                       #
+# ------------------------------------------------------------------ #
+def gamefile_to_name(gf: str) -> str:
+    return "/".join(gf.split("/")[-3:-1])
+
+
+# ------------------------------------------------------------------ #
+# (A) GENERATE — replay the eval runner's env.reset() stream          #
+# ------------------------------------------------------------------ #
+def generate_order(split: str, group_size: int, base_config_path: str) -> List[str]:
+    """Return the realized game_file order, exactly as the eval runner serves it.
+
+    Mirrors run_unified_dev_async_curator.py's ALFWorld setup + reset loop byte-for-byte:
+    build AlfredTWEnv(config, train_eval=<split>), init_env(batch_size=group_size), then repeatedly
+    env.reset() collecting info['extra.gamefile'] per served slot until all games are seen.
+    """
+    import yaml
+    from alfworld.agents.environment import get_environment  # noqa: F401 (import parity w/ eval)
+
+    with open(base_config_path) as f:
+        config = yaml.safe_load(f)
+    train_eval = "eval_in_distribution" if split == "dev" else "eval_out_of_distribution"
+    template_env = get_environment(config["env"]["type"])(config, train_eval=train_eval)
+    total_games = len(template_env.game_files)
+    env = template_env.init_env(batch_size=group_size)
+    print(f"[manifest] split={split} train_eval={train_eval} total_games={total_games} "
+          f"group_size={group_size}")
+
+    import math
+    order: List[str] = []
+    n_batches = math.ceil(total_games / group_size)
+    for b in range(n_batches):
+        ob_list, info = env.reset()
+        gfs = list(info["extra.gamefile"])
+        # last batch may be padded/short; take only as many as remain unseen
+        remaining = total_games - len(order)
+        take = min(len(gfs), remaining)
+        order.extend(str(g) for g in gfs[:take])
+    assert len(order) == total_games, f"captured {len(order)} != total {total_games}"
+    return order
+
+
+# ------------------------------------------------------------------ #
+# (B) HARVEST — realized order from a completed curator_v1 results dir #
+# ------------------------------------------------------------------ #
+def harvest_order_from_results(results_dir: str) -> List[str]:
+    """Read idx_<N>.json (sorted by N), return the 'name' sequence = the realized served order."""
+    idx_files = glob.glob(os.path.join(results_dir, "idx_*.json"))
+    if not idx_files:
+        raise FileNotFoundError(f"no idx_*.json under {results_dir}")
+
+    def _n(p):
+        return int(os.path.basename(p)[len("idx_"):-len(".json")])
+
+    idx_files.sort(key=_n)
+    names: List[str] = []
+    for p in idx_files:
+        d = json.load(open(p))
+        names.append(d.get("name"))
+    return names
+
+
+# ------------------------------------------------------------------ #
+# subsample: drop-within-block -> re-block into fresh groups          #
+# ------------------------------------------------------------------ #
+def subsample_reblock(order: List[str], group_size: int, keep_per_block: int,
+                      seed: int) -> List[List[str]]:
+    """Within each realized block of `group_size`, keep `keep_per_block` (uniform drop by seed),
+    then re-block the survivors into fresh groups of `group_size`. Preserves order + task-type mix;
+    fewer batches = less wall-clock. Returns list of batches (each a list of game_files)."""
+    rng = random.Random(seed)
+    kept: List[str] = []
+    for start in range(0, len(order), group_size):
+        block = order[start:start + group_size]
+        if len(block) <= keep_per_block:
+            kept.extend(block)
+        else:
+            idxs = sorted(rng.sample(range(len(block)), keep_per_block))  # keep order within block
+            kept.extend(block[i] for i in idxs)
+    # re-block into fresh groups of group_size
+    return [kept[i:i + group_size] for i in range(0, len(kept), group_size)]
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True, help="output manifest jsonl path")
+    ap.add_argument("--split", default="dev", choices=["dev", "ood"],
+                    help="dev=eval_in_distribution (valid_seen), ood=eval_out_of_distribution")
+    ap.add_argument("--group_size", type=int, default=10, help="eval batch_size / memory-update granularity")
+    ap.add_argument("--keep_per_block", type=int, default=5,
+                    help="games kept per realized block of group_size (subsample; group_size disables it)")
+    ap.add_argument("--n_seeds", type=int, default=2, help="independent subsample seeds (concurrent val lanes)")
+    ap.add_argument("--base_seed", type=int, default=0)
+    ap.add_argument("--same_games_all_lanes", action="store_true",
+                    help="all N lanes run the SAME game sequence (same subsample = base_seed) instead "
+                         "of N different seed subsamples. Use for PAIRED variance reduction: because "
+                         "val decoding is stochastic (temp 0.6), 2 lanes over the SAME tasks average out "
+                         "the decoding+writeback-order noise per task (each lane still keeps its OWN "
+                         "evolving store — the #5 loop enforces disjoint per-lane stores, so this stays "
+                         "eval-faithful: 2 independent evolving REPLICAS of one task sequence).")
+    ap.add_argument("--max_batches", type=int, default=0,
+                    help="if >0, TRUNCATE each seed to the first N re-blocked batches (for a tiny/fast "
+                         "SMOKE manifest; e.g. --max_batches 2 -> ~2 batches ≈ a few min instead of ~20)")
+    ap.add_argument("--from_results", default=None,
+                    help="HARVEST order from this completed curator_v1 dir instead of building the env")
+    ap.add_argument("--verify_against", default=None,
+                    help="a completed curator_v1 dir; assert generated order == its harvested name order")
+    ap.add_argument("--base_config", default=None,
+                    help="path to Alfworld/base_config.yaml (default: evaluation/agent_eval/Alfworld/base_config.yaml relative to repo)")
+    args = ap.parse_args()
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    base_config = args.base_config or os.path.join(
+        repo, "evaluation", "agent_eval", "Alfworld", "base_config.yaml")
+
+    # --- obtain the realized order (generate or harvest) ---
+    if args.from_results:
+        names = harvest_order_from_results(args.from_results)
+        print(f"[manifest] harvested {len(names)} games (names) from {args.from_results}")
+        # harvested gives NAMES not full game_files; resolve to game_files via the env for #5 pinning.
+        full_order = generate_order(args.split, args.group_size, base_config)
+        gen_names = [gamefile_to_name(g) for g in full_order]
+        if gen_names != names:
+            n_mismatch = sum(1 for a, b in zip(gen_names, names) if a != b)
+            raise SystemExit(f"[manifest] HARVEST vs GENERATE order MISMATCH ({n_mismatch}/{len(names)} "
+                             f"differ). Cannot resolve names->game_files safely.")
+        print("[manifest] harvested names == generated order ✓ (using generated full game_files)")
+        order = full_order
+    else:
+        order = generate_order(args.split, args.group_size, base_config)
+
+    # --- optional cross-check against a completed run (proves faithfulness) ---
+    if args.verify_against:
+        harvested = harvest_order_from_results(args.verify_against)
+        gen_names = [gamefile_to_name(g) for g in order]
+        m = min(len(gen_names), len(harvested))
+        n_mismatch = sum(1 for a, b in zip(gen_names[:m], harvested[:m]) if a != b)
+        status = "MATCH ✓" if (n_mismatch == 0 and len(gen_names) == len(harvested)) else \
+                 f"MISMATCH ({n_mismatch}/{m} differ; lens {len(gen_names)} vs {len(harvested)})"
+        print(f"[manifest] verify_against {os.path.basename(args.verify_against)}: {status}")
+        if n_mismatch != 0:
+            raise SystemExit("[manifest] order verification FAILED — do not trust this manifest.")
+
+    # --- subsample into per-seed re-blocked manifests ---
+    # PAIRED mode (--same_games_all_lanes): every lane row uses the SAME subsample (base_seed), so all
+    # lanes run the identical game sequence. The #5 loop still gives each lane its OWN growing store
+    # (disjoint), so this is N independent evolving replicas of ONE task sequence -> averaging kills
+    # the temp-0.6 decoding + writeback-order noise per task, not task-to-task variance.
+    # DEFAULT (unset): N different seed subsamples (independent-tasks averaging, wider coverage).
+    if args.same_games_all_lanes:
+        seeds = [args.base_seed] * args.n_seeds     # identical subsample per lane
+    else:
+        seeds = [args.base_seed + s for s in range(args.n_seeds)]
+    per_seed = []
+    for li, s in enumerate(seeds):
+        batches = subsample_reblock(order, args.group_size, args.keep_per_block, s)
+        if args.max_batches and args.max_batches > 0:
+            batches = batches[:args.max_batches]  # SMOKE truncation to the first N batches
+        # keep a unique lane id in the row even when seeds are identical (so lanes are distinguishable)
+        per_seed.append({"seed": s, "lane": li, "n_batches": len(batches),
+                         "n_games": sum(len(b) for b in batches), "batches": batches})
+        print(f"[manifest] lane={li} seed={s}: {len(batches)} batches x ~{args.group_size} "
+              f"= {sum(len(b) for b in batches)} games (from {len(order)})"
+              + ("  [PAIRED: same games as other lanes]" if args.same_games_all_lanes else ""))
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        meta = {"_meta": True, "split": args.split, "group_size": args.group_size,
+                "keep_per_block": args.keep_per_block, "n_seeds": args.n_seeds,
+                "same_games_all_lanes": bool(args.same_games_all_lanes),
+                "total_games": len(order), "raw_order": order}
+        f.write(json.dumps(meta, ensure_ascii=False) + "\n")
+        for ps in per_seed:
+            f.write(json.dumps(ps, ensure_ascii=False) + "\n")
+    print(f"[manifest] wrote {args.out}  (1 meta row + {len(per_seed)} seed rows)")
+
+
+if __name__ == "__main__":
+    main()

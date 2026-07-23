@@ -16,26 +16,28 @@
 #
 # Usage (from box2, executor served on :8001, conda env active):
 #   CUDA_VISIBLE_DEVICES=4,5,6,7 EXECUTOR_API_BASE=http://localhost:8001/v1 NGPUS=4 TEST_FREQ=1 \
-#     bash scripts/train_memcurator_smoke_direct.sh dfdfd
-
-export HYDRA_FULL_ERROR=1
-export LD_LIBRARY_PATH=/fsx/home/yefan.zhou/miniconda3/envs/memory/lib:${LD_LIBRARY_PATH:-}
+#     bash scripts/train_memcurator_smoke_direct.sh
 
 #!/usr/bin/env bash
 set -xeuo pipefail
 
+# ==== SFR VARIANT ==== everything points at the fast /fsx/sfr volume (away from the buggy /fsx/home).
+# sfr_env.sh sets the 4 shared knobs: sfr-memory conda (PATH-prepend + LD_LIBRARY_PATH), HF_HOME,
+# ALFWORLD_DATA, ALFWORLD_GAMEFILES_CACHE_DIR, and TMPDIR. Sourced RELATIVE so it works on box1/box2
+# from any cwd. Replaces the old home LD_LIBRARY_PATH + home ALFWORLD_DATA/cache/TMPDIR exports.
+source "$(dirname "$0")/../scripts/sfr_env.sh"
+
+export HYDRA_FULL_ERROR=1
+
 # ---- env_vars that `ray job submit` used to inject from runtime_env.yaml. Export them HERE so the
-# ray head + driver + all worker actors inherit them (this path does not read runtime_env.yaml). ----
+# ray head + driver + all worker actors inherit them (this path does not read runtime_env.yaml).
+# NOTE: PATH/LD_LIBRARY_PATH/HF_HOME/ALFWORLD_DATA/ALFWORLD_GAMEFILES_CACHE_DIR/TMPDIR set by sfr_env.sh. ----
 export TORCH_NCCL_AVOID_RECORD_STREAMS=1
-export PYTHONPATH="/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main:${PYTHONPATH:-}"
+export PYTHONPATH="/fsx/sfr/yefan.zhou/mem-evolve/SkillCurator-main:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export PYTHONFAULTHANDLER=1
 export RAY_DEDUP_LOGS=0
-# textworld libdownward per-step init_env temp copies -> big /fsx disk (workers inherit this).
-export TMPDIR="/fsx/home/yefan.zhou/tmp"
 export PROMPT_STYLE="${PROMPT_STYLE:-revise_react}"
-export ALFWORLD_DATA="${ALFWORLD_DATA:-/fsx/home/yefan.zhou/.cache/alfworld}"
-export ALFWORLD_GAMEFILES_CACHE_DIR="${ALFWORLD_GAMEFILES_CACHE_DIR:-/fsx/home/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache}"
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
 # ---- Artifact root: EVERYTHING under mem-evolve/results/<exp>/<stamp>/, NEVER in the repo. ----
@@ -66,7 +68,7 @@ function_content_reward_weight=0.0
 function_call_reward_weight=0.0
 
 # ---- MemCurator knobs ----
-DATASET_PATH="${DATASET_PATH:-/fsx/home/yefan.zhou/mem-evolve/data/datasets/smoke_dataset/dataset.jsonl}"
+DATASET_PATH="${DATASET_PATH:-/fsx/sfr/yefan.zhou/mem-evolve/data/datasets/smoke_dataset/dataset.jsonl}"
 EXECUTOR_MODEL="${EXECUTOR_MODEL:-openai/Qwen/Qwen3-8B}"
 EXECUTOR_API_BASE="${EXECUTOR_API_BASE:-http://localhost:8000/v1}"
 CURATOR_VARIANT="${CURATOR_VARIANT:-curator_alfworld_v1_api}"
@@ -85,6 +87,10 @@ export BASE_MODEL='Qwen/Qwen3-8B'
 export EXPERIMENT_NAME="${exp_name}"
 
 export ROLLOUT_DATA_DIR="${RUN_DIR}/rollout"
+# DUMMY math parquet — verl's dataloader loads data.train_files at startup even for ALFWorld (tasks
+# actually come from the env, this parquet is unused for stepping). It lives ONLY on the home repo
+# (gitignored, generated on the box; code rsync excluded data/). Point at home: it's a one-time
+# startup read (not per-step), so the /fsx/home access is negligible. Copy to sfr later if desired.
 TRAIN_DATA_DIR='/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main/data/math/'
 TEST_DATA_DIR='/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main/data/math/'
 
@@ -104,7 +110,7 @@ max_obs_length=500
 enable_thinking=true
 max_turns=5
 
-WORKING_DIR="/fsx/home/yefan.zhou/mem-evolve/SkillCurator-main"
+WORKING_DIR="/fsx/sfr/yefan.zhou/mem-evolve/SkillCurator-main"
 NNODES=1
 MODEL_PATH=${MODEL_PATH:-"${BASE_MODEL}"}
 CKPTS_DIR=${CKPTS_DIR:-"${RUN_DIR}/ckpt"}
@@ -210,3 +216,5 @@ python3 -u -m verl.trainer.main_ppo \
 
 echo "SMOKE-DIRECT done; on success you'll see ${total_training_steps} steps complete."
 ray stop || true
+
+# [sfr-variant] synced to /fsx/sfr dev repo — sync-trigger marker

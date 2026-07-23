@@ -69,7 +69,9 @@ import json as _json
 
 _GAME_FILES_CACHE_DIR = os.environ.get(
     "ALFWORLD_GAMEFILES_CACHE_DIR",
-    "/fsx/home/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache",
+    # DEFAULT on the fast /fsx/sfr volume (/fsx/home has the metadata-walk FS bug). Normally the env
+    # var is set by scripts/sfr_env.sh + ~/.bashrc; this default only matters for bare-python paths.
+    "/fsx/sfr/yefan.zhou/mem-evolve/data/alfworld_gamefiles_cache",
 )
 _GAME_FILES_CACHE_VERSION = "v1"  # bump to invalidate ALL caches manually (dataset/logic change)
 

@@ -330,6 +330,11 @@ PRINT_CHARS       = _env_int("PRINT_CHARS") or 0
 # The basic messages/reward/name are saved for EVERY game regardless. Adds no LLM calls;
 # just keeps strings already in memory and writes a larger json for the sampled games.
 SAVE_RAW_N = _env_int("SAVE_RAW") or 0
+# RESULTS_ROOT: optional absolute dir prefixed onto the CWD-relative results path
+# (Alfworld/Reasoning/Webshop/results/...). Unset/"" => os.path.join is a no-op, so
+# behavior is IDENTICAL to before. Set it to write results somewhere other than CWD
+# (e.g. run the sfr code but land results in the old /fsx/home results tree).
+_RESULTS_ROOT = os.environ.get("RESULTS_ROOT", "")
 SAVE_RAW = SAVE_RAW_N > 0   # gates in-memory collection inside the batch runners
 
 
@@ -2158,14 +2163,14 @@ def main(args):
 
     # ---- Path setup ----
     if args.env == 'alfworld':
-        output_path         = (f'Alfworld/results/{model_name}/'
-                               f'{args.split}_{args.exp_name}_few_shot_{args.few_shot}_{memory_type}')
+        output_path         = os.path.join(_RESULTS_ROOT, (f'Alfworld/results/{model_name}/'
+                               f'{args.split}_{args.exp_name}_few_shot_{args.few_shot}_{memory_type}'))
     elif args.env in REASONING_ENVS:
-        output_path         = (f'Reasoning/results/{args.env}/{model_name}/'
-                               f'{args.exp_name}_{memory_type}')
+        output_path         = os.path.join(_RESULTS_ROOT, (f'Reasoning/results/{args.env}/{model_name}/'
+                               f'{args.exp_name}_{memory_type}'))
     else:  # webshop
-        output_path         = (f'Webshop/results/{model_name}/'
-                               f'{args.split}_{args.exp_name}_few_shot_{args.few_shot}_{memory_type}')
+        output_path         = os.path.join(_RESULTS_ROOT, (f'Webshop/results/{model_name}/'
+                               f'{args.split}_{args.exp_name}_few_shot_{args.few_shot}_{memory_type}'))
 
     # Memory now lives INSIDE the result folder (self-contained run: idx_*.json,
     # run_config.json, run.log, and the memory store all in one place).
@@ -2487,11 +2492,11 @@ if __name__ == '__main__':
 
     # ---- Overwrite existing results ----
     if args.overwrite and args.env not in REASONING_ENVS:
-        result_dir = (
+        result_dir = os.path.join(_RESULTS_ROOT, (
             f'Alfworld/results/{args.model}/{args.split}_{args.exp_name}_few_shot_{args.few_shot}_{args.memory_type}'
             if args.env == 'alfworld' else
             f'Webshop/results/{args.model}/{args.split}_{args.exp_name}_few_shot_{args.few_shot}_{args.memory_type}'
-        )
+        ))
         if os.path.exists(result_dir):
             for file in os.listdir(result_dir):
                 os.remove(f'{result_dir}/{file}')

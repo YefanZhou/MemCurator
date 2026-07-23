@@ -141,7 +141,6 @@ def build_dataset(
     targets_path: Optional[str] = None,
     num_targets: Optional[int] = None,
     sample_with_replacement: bool = False,
-    pool_size_zero_prob: float = 0.0,
     trajectory_style: str = "both",
     think_token_budget: int = 8000,
     seed: int = 42,
@@ -243,12 +242,9 @@ def build_dataset(
         tgt_game = tgt.get("game_file", "")
         tgt_task_id = tgt["task_id"]
 
-        # stochastic pool size: with prob pool_size_zero_prob this target gets an EMPTY store
-        # (cold/no-memory test case), else the normal pool_size. Rolled per-target (seeded rng).
-        eff_pool_size = 0 if (pool_size_zero_prob > 0.0 and rng.random() < pool_size_zero_prob) else pool_size
         s_t = _build_store_for_target(
             pool, tgt_type, tgt_task_id, tgt_game,
-            eff_pool_size, pool_category_mode, same_type_frac, self_exclude_level, rng,
+            pool_size, pool_category_mode, same_type_frac, self_exclude_level, rng,
         )
 
         target_key = f"t{i:06d}"
@@ -401,10 +397,6 @@ def main() -> None:
     ap.add_argument("--num_targets", type=int, default=None,
                     help="Sample N targets (seeded), applied AFTER any --target_phat_band. Use for "
                          "smoke runs / capping (or expanding, with replacement) dataset size. Default: all.")
-    ap.add_argument("--pool_size_zero_prob", type=float, default=0.0,
-                    help="probability that a target gets an EMPTY store (pool_size=0), simulating "
-                         "the cold/no-memory test case. e.g. 0.1 -> ~10%% of targets pool=0, ~90%% "
-                         "pool=pool_size. Rolled per-target with the seeded rng. Default 0.0 (off).")
     ap.add_argument("--sample_with_replacement", action="store_true",
                     help="Draw --num_targets WITH replacement: duplicates allowed and N MAY EXCEED the "
                          "target count (oversampling). Each drawn occurrence is its own dataset row with "
@@ -433,7 +425,6 @@ def main() -> None:
         pool_status=args.pool_status, curation_mode=args.curation_mode,
         targets_path=args.targets_path, num_targets=args.num_targets,
         sample_with_replacement=args.sample_with_replacement,
-        pool_size_zero_prob=args.pool_size_zero_prob,
         trajectory_style=args.trajectory_style, think_token_budget=args.think_token_budget,
         seed=args.seed,
     )

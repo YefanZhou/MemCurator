@@ -90,10 +90,44 @@ class MemCuratorGenerationConfig(MemoryGenerationConfig):
     executor_top_k: Optional[int] = None
     executor_max_tokens: Optional[int] = None
     executor_enable_thinking: Optional[bool] = None
+    # Max concurrent executor HTTP requests per batch. 0 = unbounded (= #active slots, the old
+    # behavior). Cap it for a REMOTE/rate-limited executor (e.g. GPT gateway): fewer simultaneous
+    # requests -> fewer 429s -> fewer retry-exhaustions -> fewer silent "Output Error"->reward-0.
+    # Irrelevant for a local vLLM server (no rate limit) -> leave 0 there.
+    executor_concurrency: int = 0
     executor_max_steps: int = 30
     history_length: int = 3
     # Curator briefing generation cap (actor rollout uses config.max_response_length).
     curator_on_empty: bool = False
+
+    # ---- FAITHFUL EVOLVING VALIDATION (#5 _run_eval_loop_alfworld) ----
+    # When val_manifest_path is set, is_validation=True dispatches to the evolving-val loop that
+    # reproduces the eval runner's online-memory dynamic on the held-out manifest order (see
+    # memcurator/build_val_manifest.py + docs/memcurator_training_plan.md "Validation design").
+    # Unset -> falls through to the legacy per-target validation path (unchanged).
+    val_manifest_path: Optional[str] = None
+    # Number of independent evolving lanes (= seeds averaged for variance reduction). Each lane has
+    # its OWN cold->growing store; lanes share a wide batch only for GPU efficiency. Default 1
+    # (single lane, simplest); set 2 to average the manifest's 2 seed subsamples.
+    val_n_lanes: int = 1
+    # Curator sampling AT VALIDATION. Qwen3 thinking mode degrades under greedy (temp 0), and the
+    # shared _validate() forces do_sample=False -> temp 0; we OVERRIDE to the test-time operating
+    # point so val predicts the real eval number. Default 0.6/0.95/20 = eval's curation sampling.
+    val_curator_temperature: float = 0.6
+    val_curator_top_p: float = 0.95
+    val_curator_top_k: int = 20
+    # Write-back policy for the ephemeral per-lane val store (NOT training data — discarded after the
+    # val run, never leaks). success_only (default) mirrors eval's curator_v1 success_only_v1 memory
+    # rule so the evolving dynamic matches eval. Set False to also add failed traces (studies a
+    # DIFFERENT memory dynamic than eval -> val stops being eval-predictive; use only deliberately).
+    val_writeback_success_only: bool = True
+    # VALIDATION EXECUTOR (can differ from the training executor). The executor call is litellm ->
+    # OpenAI-compatible, so this points at either a served vLLM (local) or a real API model (e.g.
+    # gpt-5.4 via a gateway) — the eval-side _api runner proves this works. Each defaults to the
+    # TRAINING executor value when unset, so val uses the same executor unless overridden.
+    val_executor_model: Optional[str] = None
+    val_executor_api_base: Optional[str] = None
+    val_executor_api_key: Optional[str] = None
     # NOTE on reward denoising: we do NOT do K same-task executor repeats in v1. Within a GRPO
     # group the n=group_n slots reset to the SAME game (workers share seed = seed + i//group_n,
     # see envs.py:118 + AlfworldWorker.__init__), so the n rollouts already differ ONLY in the
@@ -130,6 +164,13 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
             # FALLBACK global-pool mode (superseded).
             self._dataset = None
             self._pool = self._load_frozen_pool(config.pool_path, config.retrieve_num)
+
+        # FAITHFUL EVOLVING VALIDATION (#5): load the manifest (per-seed re-blocked game_file batches).
+        # When present, is_validation=True dispatches to _run_eval_loop_alfworld (evolving memory);
+        # else validation falls through to the legacy per-target path.
+        self._val_manifest = None
+        if getattr(config, "val_manifest_path", None):
+            self._val_manifest = self._load_val_manifest(config.val_manifest_path, config.val_n_lanes)
 
     def _load_dataset(self, config) -> List[Dict]:
         rows = [json.loads(l) for l in open(config.dataset_path, encoding="utf-8") if l.strip()]
@@ -323,7 +364,8 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
     # ------------------------------------------------------------------ #
     def _run_executor_episodes(self, env_manager, briefings: List[str],
                                init_obs_dict: dict, init_infos: list,
-                               task_descs: List[str]) -> Tuple[List[float], List[int], List[str], List[List[dict]]]:
+                               task_descs: List[str],
+                               executor_override: Optional[dict] = None) -> Tuple[List[float], List[int], List[str], List[List[dict]]]:
         """Run one ALFWorld episode per slot with the briefing injected, on the ALREADY-RESET env.
 
         IMPORTANT: does NOT reset — the caller resets ONCE, generates the briefing for that exact
@@ -368,7 +410,8 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
                     context_header=CURATOR_CONTEXT_HEADER,
                     context_label=CURATOR_CONTEXT_LABEL,
                 )
-            responses = self._call_executor_batch(completion, [prompts[i] for i in active])
+            responses = self._call_executor_batch(completion, [prompts[i] for i in active],
+                                                   executor_override=executor_override)
             resp_by_slot = {i: responses[j] for j, i in enumerate(active)}
 
             # Build one action string per slot; inactive slots get a no-op the env ignores.
@@ -382,6 +425,7 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
                 traj_lines[i].append("")
                 exec_turns[i].append({
                     "step": step_idx,
+                    "observation": raw_obs[i],           # env obs at this step (for evolving-val writeback messages)
                     "executor_prompt": prompts[i],       # full prompt incl. injected briefing
                     "executor_raw": resp_by_slot[i],     # raw LLM output (has <think>/<action>)
                     "action": act_parsed,
@@ -395,6 +439,14 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
                 act_parsed = parse_action(resp_by_slot[i]) or ""
                 histories[i].append((raw_obs[i], act_parsed))
                 raw_obs[i] = next_raw[i]
+                # Success is read on `done`. VERIFIED by ground-truth replay (2026-07-21): ALFWorld
+                # fires info['won']=True and dones[i]=True TOGETHER on the exact step the goal predicate
+                # is satisfied (e.g. step-2 slot "put a cool mug in microwave" → won=True done=True at
+                # the final move). Failed episodes run to max_steps with won=False done=False. So this
+                # gate scores both cases correctly — matches SkillOS's last-active-step `won` read.
+                # (An earlier 0/8 that looked like a completed-but-unscored episode was actually a REAL
+                # failure: the "heat a Cup" task where the executor used a *mug* — mug != Cup in the PDDL
+                # goal — so won stayed False. Not a reward bug; the 0 was correct.)
                 if bool(dones[i]):
                     env_done[i] = True
                     steps_per[i] = step_idx + 1
@@ -403,17 +455,191 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
         trajectories = ["\n".join(lines) for lines in traj_lines]
         return successes, steps_per, trajectories, exec_turns
 
-    def _call_executor_batch(self, completion_fn, prompts: List[str]) -> List[str]:
-        """Call the frozen executor (litellm) on a batch of prompts. Mirrors eval's llm()."""
+    # ================================================================== #
+    # FAITHFUL EVOLVING VALIDATION (#5)                                   #
+    #   Reproduce the eval runner's ONLINE-memory dynamic on a held-out   #
+    #   manifest: cold per-lane store -> per batch retrieve/brief/execute #
+    #   -> barrier -> add(success traces) -> next batch retrieves from the #
+    #   grown store. N independent lanes (own store each) share the wide   #
+    #   batch only for GPU efficiency; lanes NEVER cross-share memory.     #
+    # ================================================================== #
+    def _load_val_manifest(self, path: str, n_lanes: int) -> Optional[Dict]:
+        """Load build_val_manifest.py output: row0 meta + per-seed rows {seed, batches:[[gf..]..]}.
+        Returns {group_size, lanes: [ [batch_of_gamefiles, ...], ... ]} using the first n_lanes seeds."""
+        rows = [json.loads(l) for l in open(path, encoding="utf-8") if l.strip()]
+        meta = rows[0]
+        seeds = rows[1:]
+        if not seeds:
+            print(f"[MemCurator][val] manifest {path} has no seed rows — evolving val disabled.")
+            return None
+        n = min(n_lanes, len(seeds))
+        if n < n_lanes:
+            print(f"[MemCurator][val] manifest has only {len(seeds)} seeds; using {n} lane(s).")
+        lanes = [seeds[i]["batches"] for i in range(n)]
+        n_batches = len(lanes[0])
+        # sanity: all lanes must have the same #batches (they came from the same subsample shape)
+        assert all(len(lb) == n_batches for lb in lanes), "manifest lanes have differing batch counts"
+        gs = meta.get("group_size", len(lanes[0][0]) if lanes and lanes[0] else 10)
+        print(f"[MemCurator][val] evolving manifest: {n} lane(s) x {n_batches} batches x ~{gs} games "
+              f"(split={meta.get('split')}, total={meta.get('total_games')})")
+        return {"group_size": gs, "n_batches": n_batches, "lanes": lanes,
+                "split": meta.get("split")}
+
+    def _run_eval_loop_alfworld(self, gen_batch, env_manager, num_gpus, global_steps) -> DataProto:
+        """Evolving held-out validation. Per batch b (0..n_batches-1): concat all lanes' b-th games
+        into ONE wide batch (lane L = slots [L*gs:(L+1)*gs]); retrieve per-lane from the GROWING
+        store L; one wide curator-briefing gen (at val sampling temp); one wide executor rollout;
+        barrier -> add(success traces) to store L (mirrors eval's memory rule) + BM25 rebuild.
+        Accumulate all slots across all batches -> one DataProto so the shared _validate() computes
+        val/alfworld_success_rate over every lane. Stores are EPHEMERAL (built cold here, discarded
+        on return) -> zero leak into training. Lanes never cross-share (all memory keyed by lane)."""
+        import tempfile, shutil
+        mani = self._val_manifest
+        lanes, gs, n_batches = mani["lanes"], mani["group_size"], mani["n_batches"]
+        n_lanes = len(lanes)
+        wide = n_lanes * gs
+        lane_of = lambda slot: slot // gs   # slot -> lane index (contiguous blocks of gs)
+        print(f"\n[MemCurator][VAL step {global_steps}] ===== EVOLVING val: {n_lanes} lane(s) x "
+              f"{n_batches} batches x {gs} = {wide}-wide, curator temp="
+              f"{self.mc_config.val_curator_temperature} =====", flush=True)
+        _t = time.time()
+
+        # cold, ephemeral per-lane stores (own temp storage_path so on-disk writes never interleave).
+        tmpdir = tempfile.mkdtemp(prefix=f"val_stores_s{global_steps}_")
+        stores = [self._backend.make_store(
+                    storage_path=os.path.join(tmpdir, f"lane{L}.jsonl"),
+                    retrieve_num=self.mc_config.retrieve_num,
+                    curator_on_empty=self.mc_config.curator_on_empty)
+                  for L in range(n_lanes)]
+
+        # val curator sampling: force the vLLM rollout's `validate` branch (do_sample=True + validate=
+        # True) so it uses actor_rollout_ref.rollout.val_kwargs.{temperature,top_p,top_k} instead of
+        # greedy (temp 0 — degenerate for Qwen3 thinking). The LAUNCHER MUST set those val_kwargs to
+        # the test-time operating point (eval curation: temp 0.6 top_p 0.95 top_k 20); the shared
+        # SPMD rollout reads temp from val_kwargs (config), NOT from meta_info, so we can't inject it
+        # per-call here — we only flip the branch. mc_config.val_curator_* record the intended values
+        # (asserted against a launcher note in the smoke); do NOT rely on them reaching vLLM directly.
+        val_meta = dict(gen_batch.meta_info)
+        val_meta.update({"do_sample": True, "validate": True})
+        print(f"[MemCurator][VAL] curator sampling via rollout.val_kwargs (launcher must set "
+              f"temperature={self.mc_config.val_curator_temperature} top_p={self.mc_config.val_curator_top_p} "
+              f"top_k={self.mc_config.val_curator_top_k}); NOT greedy.", flush=True)
+
+        # accumulators over ALL slots/batches (order: batch-major, then lane-major within a batch)
+        acc_input_ids, acc_resp_ids, acc_resp_mask = [], [], []
+        acc_briefings, acc_retrieved, acc_tasks, acc_success, acc_steps, acc_traj = [], [], [], [], [], []
+        acc_exec_turns, acc_raw, acc_prompts = [], [], []
+
+        for b in range(n_batches):
+            # build the wide batch: lane0's b-th block, then lane1's, ...
+            batch_games = []
+            for L in range(n_lanes):
+                batch_games.extend(lanes[L][b])
+            assert len(batch_games) == wide, f"batch {b}: {len(batch_games)} games != {wide}"
+
+            with self._phase(f"val b{b} pin+reset+retrieve", global_steps, True):
+                env_manager.set_slot_game_files(batch_games)
+                obs_dict, infos = env_manager.reset({})
+                task_descs = list(env_manager.tasks)
+                # retrieve per slot from ITS lane's growing store (self-exclude the slot's own game)
+                retrieved_texts = []
+                for i in range(wide):
+                    st = stores[lane_of(i)]
+                    retrieved_texts.append(
+                        self._retrieve_from_store(st, task_descs[i], batch_games[i]))
+
+            with self._phase(f"val b{b} curator briefing", global_steps, True):
+                (chunk_input_ids, response_ids, response_mask, briefings,
+                 curator_raw, curator_prompts) = self._generate_briefings(
+                    val_meta, retrieved_texts, task_descs)
+
+            with self._phase(f"val b{b} executor episodes", global_steps, True):
+                # val executor may differ from train (e.g. an API model); None fields fall back to
+                # the training executor inside _call_executor_batch.
+                _val_exec_ov = {"model": self.mc_config.val_executor_model,
+                                "api_base": self.mc_config.val_executor_api_base,
+                                "api_key": self.mc_config.val_executor_api_key}
+                successes, steps, trajectories, exec_turns = self._run_executor_episodes(
+                    env_manager, briefings, obs_dict, infos, task_descs,
+                    executor_override=_val_exec_ov)
+            n_ok = sum(1 for s in successes if s)
+            print(f"[MemCurator][VAL step {global_steps}] batch {b}: success {n_ok}/{wide} "
+                  f"(per-lane: {[sum(1 for s in successes[L*gs:(L+1)*gs] if s) for L in range(n_lanes)]})",
+                  flush=True)
+
+            # --- barrier: write-back success traces to EACH slot's own lane store (eval memory rule) ---
+            for i in range(wide):
+                won = bool(successes[i])
+                if self.mc_config.val_writeback_success_only and not won:
+                    continue  # success-only: skip failures (matches eval curator_v1 success_only_v1)
+                # build eval-parity messages from the episode's per-step (obs, raw response)
+                turns = exec_turns[i]
+                messages = []
+                for t in turns:
+                    messages.append({"role": "user", "content": t.get("observation", "")})
+                    messages.append({"role": "assistant", "content": t.get("executor_raw", "")})
+                task_id = task_descs[i][:60].replace("/", "_")
+                try:
+                    stores[lane_of(i)].add(task_id=task_id, task=task_descs[i],
+                                           messages=messages, reward=float(successes[i]))
+                except Exception as e:
+                    print(f"[MemCurator][VAL] writeback failed slot {i}: {e!r}", flush=True)
+
+            # accumulate this batch's slots
+            acc_input_ids.extend(chunk_input_ids[i] for i in range(wide))
+            acc_resp_ids.extend(response_ids[i] for i in range(wide))
+            acc_resp_mask.extend(response_mask[i] for i in range(wide))
+            acc_briefings.extend(briefings); acc_retrieved.extend(retrieved_texts)
+            acc_tasks.extend(task_descs); acc_success.extend(float(s) for s in successes)
+            acc_steps.extend(steps); acc_traj.extend(trajectories)
+            acc_exec_turns.extend(exec_turns); acc_raw.extend(curator_raw); acc_prompts.extend(curator_prompts)
+            # per-batch enriched dump (ALL slots, success+fail) — same schema as training dump
+            self._dump_step_log(f"{global_steps}_b{b}", True, task_descs, retrieved_texts,
+                                briefings, [float(s) for s in successes], trajectories,
+                                exec_turns=exec_turns, curator_raw=curator_raw, curator_prompts=curator_prompts)
+
+        # lane-safety self-check: the per-lane stores must be disjoint (no cross-shared trace).
+        if n_lanes > 1:
+            banks = [set(id(r) for r in st.memory_bank) for st in stores]
+            for a in range(n_lanes):
+                for c in range(a + 1, n_lanes):
+                    assert banks[a].isdisjoint(banks[c]), f"LANE LEAK: store {a} & {c} share traces!"
+
+        shutil.rmtree(tmpdir, ignore_errors=True)   # ephemeral stores gone -> no leak into training
+        total = len(acc_success)
+        n_ok = int(sum(acc_success))
+        print(f"[MemCurator][VAL step {global_steps}] ===== EVOLVING val done: {n_ok}/{total} "
+              f"success over {n_lanes} lane(s) in {time.time()-_t:.1f}s =====", flush=True)
+
+        return self._assemble_output(
+            chunk_input_ids=acc_input_ids, response_ids=acc_resp_ids, response_mask=acc_resp_mask,
+            briefings=acc_briefings, retrieved_texts=acc_retrieved, task_descs=acc_tasks,
+            mean_success=acc_success, steps=acc_steps, trajectories=acc_traj,
+            exec_turns=acc_exec_turns, curator_raw=acc_raw, curator_prompts=acc_prompts,
+            gen_batch=gen_batch, num_gpus=num_gpus, global_steps=global_steps, is_validation=True)
+
+    def _call_executor_batch(self, completion_fn, prompts: List[str],
+                             executor_override: Optional[dict] = None) -> List[str]:
+        """Call the frozen executor (litellm) on a batch of prompts. Mirrors eval's llm().
+
+        executor_override (used by the evolving-val loop) may set {model, api_base, api_key} to point
+        at a DIFFERENT executor than training (e.g. an API model). Sampling params (temperature/top_p/
+        top_k/max_tokens/enable_thinking) always come from mc_config — the executor is FROZEN, so its
+        sampling is fixed to the harvest-parity values regardless of which endpoint serves it.
+        """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         c = self.mc_config
+        ov = executor_override or {}
+        model = ov.get("model") or c.executor_model
+        api_base = ov.get("api_base") or c.executor_api_base
+        api_key = ov.get("api_key") or c.executor_api_key
 
         def _one(prompt: str) -> str:
             kwargs = dict(
-                model=c.executor_model,
+                model=model,
                 messages=[{"role": "user", "content": prompt}],
-                api_key=c.executor_api_key,
-                base_url=c.executor_api_base,
+                api_key=api_key,
+                base_url=api_base,
                 num_retries=10,
                 temperature=c.executor_temperature,
             )
@@ -435,7 +661,10 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
                 return f"Output Error: {e}"
 
         out = [""] * len(prompts)
-        with ThreadPoolExecutor(max_workers=max(1, len(prompts))) as pool:
+        # cap concurrency for a rate-limited (remote) executor; 0 -> unbounded (= #prompts, old behavior)
+        _cc = getattr(c, "executor_concurrency", 0) or 0
+        _workers = max(1, len(prompts)) if _cc <= 0 else max(1, min(_cc, len(prompts)))
+        with ThreadPoolExecutor(max_workers=_workers) as pool:
             futs = {pool.submit(_one, p): i for i, p in enumerate(prompts)}
             for fut in as_completed(futs):
                 out[futs[fut]] = fut.result()
@@ -475,6 +704,13 @@ class MemCuratorGenerationManager(MemoryGenerationManager):
         """
         if num_tasks not in (None, 1):
             print(f"[MemCurator] note: num_tasks={num_tasks} ignored (single-task-per-step design).")
+
+        # FAITHFUL EVOLVING VALIDATION (#5): when validating AND a manifest is loaded, reproduce the
+        # eval runner's online-memory dynamic on the held-out manifest order (cold store grows via
+        # add() at each batch barrier). Otherwise fall through to the legacy per-target val/train path.
+        if is_validation and self._val_manifest is not None:
+            return self._run_eval_loop_alfworld(gen_batch, env_manager, num_gpus, global_steps)
+
         total_batch_size = gen_batch.batch["input_ids"].shape[0]
         n_rollouts = getattr(self, "_n_rollouts", None) or 1
         _tag = "VAL" if is_validation else "TRAIN"
